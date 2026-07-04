@@ -5,7 +5,6 @@
 // AllocateUserPhysicalPages: OS gives a pool of physical pages, specifially its PFN
 
 // DEBUGGER CHEATSHEET
-
 // Left 8 digit number = start address, right = end address
 
 // ? = equation/quick math
@@ -31,6 +30,9 @@
 // ?? var_name = gives value of that variable
 // x = see list of globals
 
+// Common debugger error codes
+// c0000005: access violation, touching memory you don't own
+
 // Performance trace cheat sheet
 // xperf -on base -stackwalk profile
 // Then run your program
@@ -38,18 +40,98 @@
 // trace1.etl
 // Once in the trace, click Trace and then Load Symbols
 
+// Pointer Cheat Sheet
+// *(physical_page_to_virtual + i) == physical_page_to_virtual[i]
+
+// Virtual Memory Management Concepts
+// Get the VA: VA BASE + i * 4K (size of a page)
+// Efficiency: unmapping takes more energy than mapping; therefore, batching allows optimization
+
+// Disk states (may disk retrieval) (keep a free list for this)
+// 1. Valid
+// 2. Not valid (don't read) (soft fault afterwards)
+
+// Four States of PTE (pfn, d, t, v)
+// 1. Zero: (0,0,0,0)
+// 2. Valid: (pfn,0,0,1)
+// 3. Transition: (pfn, 0, 1, 0) In which the PFN can go from modified to standby
+// also, in substate: possibility that the page is written to disk when switching PFN states
+// a. can go soft fault
+// b. can go to disk
+// 4. Disk format (only in disk!) (disk index,1,0,0): page is repurposed from standby list
+
+// States in PFN Metadata/Three type of list (optional)
+// 1. free list: free page
+// 2. active list (not mL compatible)
+// 3. been modified by user list: pages that need to be written to disk
+// Still transition state in pte; it means that v = 0, t = 1 but only stored in pages
+// 4. standby list: list of pages already in disk
+// Still transititon state in pte; it means that v = 0, t = 1 but stored in both pages and disk
+// Length of list: invaluable information regarding trimming amount, batching, etc...
+
+// TODO: multithreading: all window api
+// createThread(function_to_begin_life_in): how to create other "coworkers"
+    // when function_to_begin_life_in hits a return, thread dies (only when everything is done)
+// waitForSingleObject
+// waitForMultipleObject
+// setEvent: based on certain criteria make, can trigger the thread to do stuff
+    // i.e. trim pages when free pages num are low
+// enterCriticalSection: serves as a lock to prevent race condition. only allows one thread to go at a time
+    // and then call leave, allowing next thread
+    // (when one thing is faster,
+    // causing misinformation/when 2 cpus are accessing the same data, and one is going to be faster)
+// leaveCriticalSection
+
+// When do we want a lock?
+// Given a chunk of memory, at least one thread is writing to it while the other is also either reading/writing
+    // a) both threads are editing the same data concurrently
+// Deadlock: when two threads have opposite order, such that one thread wants the lock of the other
+// and the other thread wants the lock of the opposite (i.e. one thread: A -> B, second thread B -> A)
+// as a thread only releases the locks after their entire task is complete (i.e. going from function A -> B -> DONE)
+// solution:
+        // a) if x amount of time passed and the task is not complete, release the locks
+        // b) only allow one order (i.e. A -> B)
+    // goal: detect it soon enough, so you can back up and avoid
+
+// page table -> faults
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
 
+// MULTITHREADING HELPER FUNCTIONS
+// This is the function your threads will execute
+HANDLE shutdown_event;
+#define NUMBER_OF_PHYSICAL_PAGES 4 // ((VIRTUAL_ADDRESS_SIZE / PAGE_SIZE) / 64)
+#define NUM_DISC_PAGES 4 // (MB(2) / PAGE_SIZE)
+
+// The bar we have to meet to trigger trimming measured by free+standby count
+#define TRIM_LOW_BAR (NUMBER_OF_PHYSICAL_PAGES / 2)
+// How many pages to trim per batch
+#define TRIM_BATCH_SIZE (NUMBER_OF_PHYSICAL_PAGES / 2)
+// Number of modified pages we want before writing to disk
+// Number can't exceed the disk size
+# define WRITE_BATCH_SIZE ((TRIM_BATCH_SIZE < NUM_DISC_PAGES) ? TRIM_BATCH_SIZE : NUM_DISC_PAGES)
+
+#define MAX_DISC_PTE_BITS 40
+
+#define MAX_DISC_SIZE ((ULONG64) 1 << MAX_DISC_PTE_BITS)
+// Define thresholds for the bar for low memory
+
+#define NUM_THREADS 4
+
+// Create a bit map to track the occupancy of a page's data
+char *written;
+
 // List Head Primitives to build Linked Lists
 // Functions include: initialize, isListEmpty, insert, remove
-
 // typedef struct _LIST_ENTRY {
 //     struct _LIST_ENTRY *Flink;
 //     struct _LIST_ENTRY *Blink;
 // } LIST_ENTRY, *PLIST_ENTRY;
 
+
+#define DEBUG 0
 VOID
 InitializeListHead (
     PLIST_ENTRY ListHead
@@ -144,7 +226,7 @@ RemoveEntryList (
 // detect and fix unintended failures to unmap virtual addresses properly.
 //
 
-#define SUPPORT_MULTIPLE_VA_TO_SAME_PAGE 0
+#define SUPPORT_MULTIPLE_VA_TO_SAME_PAGE 1
 #pragma comment(lib, "advapi32.lib")
 
 // If multiple VA, it links to onecore.lib
@@ -163,17 +245,36 @@ RemoveEntryList (
 // within bounds.
 //
 
-#define NUMBER_OF_PHYSICAL_PAGES 1000 // ((VIRTUAL_ADDRESS_SIZE / PAGE_SIZE) / 64)
-#define NUM_DISC_PAGES MB(2)
-#define MAX_DISC_PTE_BITS 40
-#define MAX_DISC_SIZE ((ULONG64) 1 << MAX_DISC_PTE_BITS)
+// Events
+HANDLE trim_needed;
+HANDLE write_needed;
+HANDLE pages_available;
+
+// Locks for multi-threading
+CRITICAL_SECTION pfn_lock;
+CRITICAL_SECTION pte_lock;
+CRITICAL_SECTION disc_lock;
 
 ULONG_PTR virtual_address_size_in_unsigned_chunks;
 
-int num_soft_fault = 0;
-int num_hard_fault = 0;
-int num_repurpose = 0;
+// __declspec(thread) keyword: allows each thread to have it's own private copy of the below variables that act as globals
+__declspec(thread) int my_hard_faults = 0;
+__declspec(thread) int my_soft_faults = 0;
+__declspec(thread) int my_repurpose_faults = 0;
 
+__declspec(thread) int my_thread_id = -1;
+
+// Struct for the number of different faults per thread
+typedef struct {
+    int thread_id;
+    int hard_faults;
+    int soft_faults;
+    int repurpose_faults;
+    int total_accesses;
+} ThreadStats;
+
+// Create an array that demonstrates each thread's final results
+ThreadStats final_results[NUM_THREADS];
 
 // PTE Struct with three states: valid, transition, and disc
 typedef struct {
@@ -208,8 +309,12 @@ typedef struct {
 
 // Create a global variable of an array of PTEs
 PPTE page_table;
-// Pointer to the start of the space allocated for the virtual address
+// Pointer to the start of the space allocated for the user virtual address
 PULONG_PTR va_space_start;
+
+// Pointer to the start of the space allocated for the system virtual address
+// Used specifically for mapping page's data to the disk
+PULONG_PTR system_va_start;
 
 // Increment age unless age equals the maximum of 7; therefore, it remains the same
 VOID
@@ -225,6 +330,7 @@ typedef struct {
     PPTE pte;
     ULONG_PTR disc_index: MAX_DISC_PTE_BITS;
     ULONG_PTR isOccupied: 2; // 00-free, 01-active, 10-modified, 11-standby
+    ULONG_PTR write_in_progress: 1; // 1: being written to disc
 } pfn_metadata;
 
 // Sets up global variable that points to the allocated memory of the pfn_metadata
@@ -237,6 +343,11 @@ PULONG_PTR physical_page_numbers;
 LIST_ENTRY pfn_free_list;
 LIST_ENTRY pfn_modified_list;
 LIST_ENTRY pfn_standby_list;
+
+// Counters to keep track of the size of each list
+int free_list_count = 0;
+int modified_list_count = 0;
+int standby_list_count = 0;
 
 // Initializes the space for the page table and sets everything to valid bit, 0 and PFN, 0
 PVOID
@@ -269,10 +380,14 @@ get_va_from_pte(PPTE pte) {
     return va_space_start + (pte_index * (PAGE_SIZE / sizeof (ULONG_PTR)));
 }
 
+// TODO: need a lock!
 // Set the frame number to the physical page and set valid bit to 1
 VOID
 set_pte_valid(PPTE pte, ULONG_PTR frame_number) {
+    // Set new frame number
     pte->hardware.frame_number = frame_number;
+    // Reset hardware age
+    pte->hardware.age = 0;
     pte->hardware.valid = TRUE;
 }
 
@@ -283,12 +398,21 @@ set_pte_invalid(PPTE pte) {
 }
 
 ULONG_PTR disc_page_count = NUM_DISC_PAGES;
-
-// Disk Metadata: simply an array for now, later, can change to struct
-PBOOLEAN disc_metadata;
+int filled_disc_slots = 0;
 
 // Initialize disc
-PVOID page_file_base;
+PVOID official_disc;
+
+typedef struct _DISC_SLOT_ENTRY {
+    LIST_ENTRY list;
+    ULONG_PTR  slot_index;
+    BOOLEAN valid;
+} DISC_SLOT_ENTRY, *PDISC_SLOT_ENTRY;
+
+// Pointer to the memory resevered for the disk
+DISC_SLOT_ENTRY * disc_slot_entry;
+// Free list of disc slots
+LIST_ENTRY disc_free_list;
 
 PVOID
 create_page_file() {
@@ -299,56 +423,99 @@ create_page_file() {
 
     // In the memory, reserve pages for our fake disc
     ULONG_PTR num_bytes = disc_page_count * PAGE_SIZE;
-    page_file_base = malloc(num_bytes);
+    official_disc = malloc(num_bytes);
 
     // If the malloc fails, attempt to allocate half the memory size until it succeds
-    while (page_file_base == NULL) {
+    while (official_disc == NULL) {
         num_bytes /= 2;
-        page_file_base = malloc (num_bytes);
+        official_disc = malloc (num_bytes);
     }
 
     disc_page_count = num_bytes / PAGE_SIZE;
-    //
-    disc_metadata = zero_malloc(disc_page_count);
-    return page_file_base;
+
+    // Allocate memory for the disc slot entries
+    disc_slot_entry = (DISC_SLOT_ENTRY *) zero_malloc (disc_page_count * sizeof(DISC_SLOT_ENTRY));
+
+    // Build the free list of free disc pages
+    InitializeListHead(&disc_free_list);
+
+    // Iterate through the disc free list and initialize all flinks
+    for (int i = 0; i < disc_page_count; i++) {
+        DISC_SLOT_ENTRY *entry = &disc_slot_entry[i];
+        // Update slot index which is apart of the disk struct
+        entry->slot_index = i;
+        entry->valid = FALSE;
+
+        InsertTailList(&disc_free_list, &entry->list);
+    }
+    return official_disc;
 }
 
-// Iterate through the disc to find a empty page based on the disc metadata
+// Iterate through the disc to find an empty page based on the disc metadata
 int find_free_disc_slot() {
-    for (int i = 0; i < disc_page_count; i++) {
-        if (disc_metadata[i] == FALSE) {
-            disc_metadata[i] = TRUE;
-            return i;
-        }
+    EnterCriticalSection(&disc_lock);
+
+    // Check if free list is empty, meaning disk is full
+    if (IsListEmpty(&disc_free_list)) {
+        printf("DISK find_free_disc_slot: disk full filled=%d / total=%llu\n",
+            filled_disc_slots, (unsigned long long)disc_page_count);
+        LeaveCriticalSection(&disc_lock);
+        return -1;
     }
-    return -1;
+
+    // Pop the head of the disc free list making the operation O(1)
+    PLIST_ENTRY list_entry = RemoveHeadList(&disc_free_list);
+
+    // Find the slot index of the free disc page to return
+    DISC_SLOT_ENTRY * slot_entry = (DISC_SLOT_ENTRY *) list_entry;
+    ULONG_PTR slot = slot_entry->slot_index;
+
+    // Update disc metadata
+    slot_entry->valid = TRUE;
+
+    // Update the occupied disc slot counter
+    filled_disc_slots++;
+
+    LeaveCriticalSection(&disc_lock);
+    return slot;
 }
 
 // Free disc space
 VOID
 empty_disc_slot(ULONG_PTR slot) {
+    EnterCriticalSection(&disc_lock);
+
     if (slot >= disc_page_count) {
-        printf("Disk slot out of bounds");
+        printf("Disk slot out of bounds\n");
         DebugBreak();
+        LeaveCriticalSection(&disc_lock);
         return;
     }
 
-    if (disc_metadata[slot] == FALSE) {
-        printf("Disc metadata twice FALSE");
+    DISC_SLOT_ENTRY *entry = &disc_slot_entry[slot];
+
+    if (entry->valid == FALSE) {
+        printf("Disc metadata twice FALSE\n");
         DebugBreak();
+        LeaveCriticalSection(&disc_lock);
         return;
     }
 
-    disc_metadata[slot] = FALSE;
+    // Update Disc Metadata and Counters
+    entry->valid = FALSE;
+    InsertTailList(&disc_free_list, &entry->list);
+    filled_disc_slots--;
+
+    LeaveCriticalSection(&disc_lock);
 }
 
 // TODO; remove pfn field from frame number
 // TODO: watch out for straddling
 VOID
-setup_pfn_table() {
+setup_pfn_table(PULONG_PTR physical_page_numbers, ULONG_PTR physical_page_count) {
     // Find the maximum frame number by iterating through every physical page
     max_frame_number = 0;
-    for (int i = 0; i < NUMBER_OF_PHYSICAL_PAGES; i++) {
+    for (int i = 0; i < physical_page_count; i++) {
         if (max_frame_number < physical_page_numbers[i]) {
             max_frame_number = physical_page_numbers[i];
         }
@@ -360,13 +527,13 @@ setup_pfn_table() {
 
     // Check if the memory was successfully reserved
     if (pfn_table == NULL) {
-        printf("Failed to reserve memory for the pfn_table/pfn metadata");
+        printf("Failed to reserve memory for the pfn_table/pfn metadata\n");
         DebugBreak();
         return;
     }
 
     // Commit the real physical pages by iterating through the physical page numbers and committing them
-    for (int i = 0; i < NUMBER_OF_PHYSICAL_PAGES; i++) {
+    for (int i = 0; i < physical_page_count; i++) {
         // Find the frame number
         ULONG_PTR frame_number = physical_page_numbers[i];
         // Find the address of the corresponding pfn_table entry of that frame_number
@@ -374,6 +541,7 @@ setup_pfn_table() {
 
         memset(pfn, 0, sizeof(pfn_metadata));
         InsertTailList(&pfn_free_list, &pfn->list);
+        free_list_count++;
     }
 }
 
@@ -516,14 +684,32 @@ CreateSharedMemorySection (
 // Number of physical pages that are actually allocated by the OS
 ULONG_PTR physical_page_count = NUMBER_OF_PHYSICAL_PAGES;
 
-//
-void
-trim_pages (int batch_size, ULONG_PTR count) {
+// TODO: if more than num percent of overall pages on standby pages
+// TODO: if 90 percent, trim
+// TODO: if not, don't trim
+// Create a event
+// TODO: every now and then, need the get_free_pages to wait and not get in the way of trim_pages
+VOID
+trim_pages () {
+    EnterCriticalSection(&pfn_lock);
+    // If trim pages was unneccarily called, check if it is low or now
+    if (standby_list_count + free_list_count >= TRIM_BATCH_SIZE) {
+        printf("trim pages entered, ofund pages avaialble\n");
+        SetEvent(pages_available);
+        LeaveCriticalSection(&pfn_lock);
+        return;
+    }
+
+    LeaveCriticalSection(&pfn_lock);
+
+    ULONG_PTR count = physical_page_count;
+
     PULONG_PTR va_to_unmap[NUMBER_OF_PHYSICAL_PAGES / 2];
     int num_pages_unmapped = 0;
 
     // Iterate through the pfn_metadata to find the oldest pages
-    while (num_pages_unmapped < batch_size) {
+    while (num_pages_unmapped < TRIM_BATCH_SIZE) {
+        printf("Entered trim_pages\n");
         pfn_metadata * oldest_pfn = NULL;
         ULONG_PTR highest_age = 0;
 
@@ -556,18 +742,7 @@ trim_pages (int batch_size, ULONG_PTR count) {
         va_to_unmap[num_pages_unmapped] = get_va_from_pte(remove_pte);
         num_pages_unmapped++;
 
-        int disc_slot = find_free_disc_slot();
-        if (disc_slot == -1) {
-            printf("Trim Pges: out of disc\n");
-            // Back out the VA
-            num_pages_unmapped--;
-            break;
-        }
-
-        // Calc va
-        PULONG_PTR va = get_va_from_pte(remove_pte);
-        // Write to disc before the batch unmap, remove_pte must still reach the frame
-        memcpy((char*)page_file_base + disc_slot * PAGE_SIZE, va, PAGE_SIZE);
+        EnterCriticalSection(&pte_lock);
 
         // Update the pfn_metadata and pte
         set_pte_invalid(remove_pte);
@@ -575,12 +750,17 @@ trim_pages (int batch_size, ULONG_PTR count) {
         // TODO: why do i have to reset the frame number? is it not already correct
         remove_pte->transition.frame_number = find_frame_number_from_pfn(oldest_pfn);
 
-        oldest_pfn->disc_index = disc_slot;
-        oldest_pfn->isOccupied = 3;
+        LeaveCriticalSection(&pte_lock);
 
-        // Add the pfn into the standby list, meaning
-        // TODO: what is standby_ agan
-        InsertTailList(&pfn_standby_list, &oldest_pfn->list);
+        EnterCriticalSection(&pfn_lock);
+        oldest_pfn->isOccupied = 2;
+        // Add the pfn into the modified list
+        printf("insert into modified liest\n");
+        InsertTailList(&pfn_modified_list, &oldest_pfn->list);
+        modified_list_count++;
+        printf("modified list count in trim pages: %d\n", modified_list_count);
+        LeaveCriticalSection(&pfn_lock);
+
     }
 
     // Batch unmap
@@ -592,14 +772,78 @@ trim_pages (int batch_size, ULONG_PTR count) {
     }
 }
 
+VOID
+write_to_disk (int count, pfn_metadata ** pages_to_write) {
+    // Arrays for scatter mapping
+    PVOID va_array[WRITE_BATCH_SIZE];
+    ULONG_PTR pfn_array[WRITE_BATCH_SIZE];
+    for (int i = 0; i < count; i += 1) {
+        // Get the pointer of the pfn metadata which is the same as the address of entry
+        // As in pte metadata struct, entry is intentionally the first entry of pfn metadata
+        pfn_metadata* meta = pages_to_write[i];
+
+        // Get the frame number of physical page
+        ULONG_PTR pfn = find_frame_number_from_pfn(meta);
+
+        // Create a slot (one only per entry) in the system VA space
+        PULONG_PTR sys_slot = (PULONG_PTR)((PBYTE)system_va_start + i * PAGE_SIZE);
+
+        va_array[i] = (PVOID)sys_slot;
+        pfn_array[i] = pfn;
+    }
+
+    // Map multiple pages to sys VA at once for efficiency
+    if (MapUserPhysicalPagesScatter(va_array, count, pfn_array) == FALSE) {
+        printf("WRITE TO DISK: Scatter map failed, count=%d\n", count);
+        return;
+    }
+
+    // Copy the data from the page to the disk
+    for (int i = 0; i < count; i += 1) {
+        pfn_metadata *meta = pages_to_write[i];
+        PULONG_PTR sys_slot = (PULONG_PTR)va_array[i];
+
+        // Find a free disc slot
+        int disc_slot = find_free_disc_slot();
+
+        if (disc_slot == -1) {
+            printf("WRITE TO DISK: No free disc slot for page %d as its filled=%d / total=%llu\n",
+                i, filled_disc_slots, (unsigned long long)disc_page_count);
+            DebugBreak();
+            continue;
+        }
+
+        // Write the data to the disc
+        memcpy((char*)official_disc + disc_slot * PAGE_SIZE, sys_slot, PAGE_SIZE);
+
+        // TODO: do i need these
+        EnterCriticalSection(&pfn_lock);
+        // Update pte metadata
+        meta->disc_index = disc_slot;
+        printf("Successfull Write to Disk\n");
+        LeaveCriticalSection(&pfn_lock);
+    }
+}
 //
 pfn_metadata *
 get_free_page() {
+    // Claim the lock
+    EnterCriticalSection(&pfn_lock);
+
     // Free: If free list is not empty, take a free page
     if (IsListEmpty(&pfn_free_list) == FALSE) {
         // Move the list from the free list
         PLIST_ENTRY entry = RemoveHeadList(&pfn_free_list);
+        free_list_count--;
+
         pfn_metadata *meta = (pfn_metadata *) entry;
+
+        // Set the page metadata to isOccupied
+        meta->isOccupied = 1;
+
+        // Release the lock after finishing
+        LeaveCriticalSection(&pfn_lock);
+
         return meta;
     }
 
@@ -607,6 +851,8 @@ get_free_page() {
     if (IsListEmpty(&pfn_standby_list) == FALSE) {
         // Move the list from the standby list
         PLIST_ENTRY entry = RemoveHeadList(&pfn_standby_list);
+        standby_list_count--;
+
         pfn_metadata *meta = (pfn_metadata *) entry;
 
         // Get the address of the pte related to the data in the standby page
@@ -624,81 +870,209 @@ get_free_page() {
         // Update the contents of the pte
         *old_pte = new_pte_contents;
 
-        num_repurpose++;
+        my_repurpose_faults++;
+
+        // Set the page metadata to isOccupied
+        meta->isOccupied = 1;
+
+        // Release the lock after finishing
+        LeaveCriticalSection(&pfn_lock);
+
         return meta;
     }
 
-    // TODO: multithreading: all window api
-    // createThread(function_to_begin_life_in): how to create other "coworkers"
-    // when function_to_begin_life_in hits a return, thread dies (only when everything is done)
-    // waitForSingleObject
-    // waitForMultipleObject
-    // setEvent: based on certain criteria make, can trigger the thread to do stuff
-    // i.e. trim pages when free pages num are low
-    // enterCriticalSection: serves as a lock to prevent race condition. only allows one thread to go at a time
-    // and then call leave, allowing next thread
-    // (when one thing is faster,
-    // causing misinformation/when 2 cpus are accessing the same data, and one is going to be faster)
-    // leaveCriticalSection
+    LeaveCriticalSection(&pfn_lock);
 
-    // deadlock: when two threads want both locks, but each thread won't let go of their own
-    // happens when the two threads go in diff order
-    // best case: to prevent, instill one order, A -> B not B -> A as well
-    // fallback: detect it soon enough, so you can "back up"
-
-    // locks
-    // directions a resource can be accessed (important for deadlock orders)
-    // i.e. page table first -> then faults
-
-    // create target functions
-    // faulting and the arbitrary function
-    // aging
-    // trimming
-    // modified page writing
-
-
-    // TODO: add the modified
-    // 1. write to disk
-    // 2. add to standby
-    // 3. repurpose
-
-    // Trim active pages
-    // TODO: figure out batching size
-    // Number that represents the number of pages that will be unmapped
-    int batch_size = NUMBER_OF_PHYSICAL_PAGES / 2;
-
-    // TODO: later this will be its own thread
-    // If there is no free or pages in standby, trim
-    trim_pages(batch_size, physical_page_count);
-
-    if (IsListEmpty(&pfn_standby_list) == FALSE) {
-        PLIST_ENTRY entry = RemoveHeadList(&pfn_standby_list);
-        pfn_metadata *meta = (pfn_metadata *) entry;
-
-        PPTE old_pte = meta->pte;
-        PTE new_pte_contents = *old_pte;
-        new_pte_contents.disc.valid      = 0;
-        new_pte_contents.disc.transition = 0;
-        new_pte_contents.disc.disc       = 1;
-        new_pte_contents.disc.disc_index = meta->disc_index;
-        *old_pte = new_pte_contents;
-
-        num_repurpose++;
-        return meta;
-    }
+    // If there are none, we must trim the pages by triggering the event
+    SetEvent(trim_needed);
 
     // Get free page failed
-    printf("Failed to get free page");
-    DebugBreak();
+    printf("GET_FREE_PAGE free=0, standby=0. We want to trim and then most likely need to write too (free=%d, standby=%d, modified=%d)\n",
+           free_list_count, standby_list_count, modified_list_count);
+    // Even if error, ensure the pfn lock can be released
     return NULL;
 }
 
 VOID
 activate_page (PPTE pte, pfn_metadata *meta, ULONG_PTR pfn) {
-    set_pte_valid(pte, pfn);
-    pte->hardware.age = 1;
+    // Point physical page back to PTE
     meta->pte = pte;
+    // Update pfn status
     meta->isOccupied = 1;
+}
+
+DWORD WINAPI
+trim_thread (LPVOID lpParam) {
+    // Every 50 milliseconds, the thread wakes up unless the shutdown event is fired
+    while (WaitForSingleObject (shutdown_event, 2) != WAIT_OBJECT_0) {
+        BOOL need_to_trim = FALSE;
+
+        EnterCriticalSection (&pfn_lock);
+        // Check if the combined number of free or standby pages list are running low
+        //TODO: later change to like number
+        need_to_trim = (free_list_count + standby_list_count) < TRIM_LOW_BAR;
+        LeaveCriticalSection (&pfn_lock);
+
+        if (need_to_trim) {
+            trim_pages();
+            printf("TRIM THREAD: preemptive thread.\n");
+            // Call the write thread to move from modified to standby
+            if (modified_list_count >= WRITE_BATCH_SIZE) {
+                SetEvent(write_needed);
+            }
+        }
+
+        // In case there are no pages available in standby_list or free_list, get_free_page needs to trim pages
+        // It calls the trim_needed event, triggering the trim_thread to trim
+        if (WaitForSingleObject(trim_needed, 0) == WAIT_OBJECT_0) {
+            trim_pages();
+            printf("TRIM THREAD: emergency thread since no free/standby. Curr Stas:) free=%d, standby=%d, modified=%d\n ",
+                free_list_count, standby_list_count, modified_list_count);
+
+            // Check the status of free, standby, modified pages
+            EnterCriticalSection(&pfn_lock);
+            int free = free_list_count;
+            int modified = modified_list_count;
+            int standby = standby_list_count;
+            LeaveCriticalSection(&pfn_lock);
+
+            // If the write or another thread, freed some pages; therefore, not requiring a write
+            if (free + standby > 0) {
+                printf("TRIM THREAD: emergency thread with no need to write. Curr Stas:) free=%d, standby=%d, modified=%d\n ",
+                    free_list_count, standby_list_count, modified_list_count);
+                SetEvent(pages_available);
+            }
+            // If there are no free or standby pages, must write to make standby pages
+            else if (modified > 0) {
+                printf("TRIM THREAD: emergency thread with write. Curr Stas:) free=%d, standby=%d, modified=%d\n ",
+                    free_list_count, standby_list_count, modified_list_count);
+                SetEvent(write_needed);
+            }
+            // Else, we exhausted every option
+            else {
+                // TODO: only problem, if stuck, that means the event that is waiting remains waiting
+                // What i realized is that it probably won't as i preemtively thread
+                // I call trim_needed again for the sake of the Wait,
+                printf("TRIM THREAD: Trim failed. Emergency thread failed\n");
+                printf("All pages currently active right now\n");
+
+                // Call trim_needed again to retry as all pages are currently active as the thread that called the event
+                // is still waiting for the pages_available call
+                SetEvent(trim_needed);
+            }
+
+        }
+    }
+}
+
+DWORD WINAPI
+write_thread (LPVOID lpParam) {
+    // Create an array of events that trigger the thread
+    HANDLE events[2] = { write_needed, shutdown_event };
+
+    while (TRUE) {
+        // Triggered by either one
+        DWORD result = WaitForMultipleObjects (2, events, FALSE, INFINITE);
+
+        // If the event that triggered was shut_down event, exit.
+        if (result == WAIT_OBJECT_0 + 1) {
+            break;
+        }
+
+        // Check to make sure if modified list has entries to write to disk
+        if (IsListEmpty(&pfn_modified_list)) {
+            // If there are available pages, make sure to set event
+            EnterCriticalSection (&pfn_lock);
+            if (free_list_count + standby_list_count > 0) {
+                SetEvent(pages_available);
+            }
+            LeaveCriticalSection (&pfn_lock);
+            continue;
+        }
+
+        // Find how many avilable disc slots based on counter of filled pages
+        EnterCriticalSection (&disc_lock);
+        int available_disc_slots =  disc_page_count - filled_disc_slots;
+        LeaveCriticalSection (&disc_lock);
+
+        // If there are no empty slots
+        if (available_disc_slots <= 0) {
+            // Disk is full so pages cannot go from modified to disk
+            printf("WRITE THREAD: Disk is full\n");
+
+            EnterCriticalSection (&pfn_lock);
+            // Check if there are free pages or standby list pages
+            if (standby_list_count > 0 || free_list_count > 0) {
+                // Allow repurpose and signal finished of trim and write thread
+                SetEvent(pages_available);
+            }
+            LeaveCriticalSection (&pfn_lock);
+            continue;
+        }
+
+        // Mark pages to write to disk as write in progress and store into an array
+        pfn_metadata * pages_to_write[WRITE_BATCH_SIZE];
+        int num_pages_written = 0;
+
+        EnterCriticalSection (&pfn_lock);
+
+        // Get the pointer to the head page of the modified list
+        PLIST_ENTRY current = pfn_modified_list.Flink;
+
+        // Iterate through until we either do not have any pages in modifed or we reached batch size
+        // Also, check if there is space in the disk
+        while (num_pages_written < available_disc_slots &&
+            num_pages_written < WRITE_BATCH_SIZE &&
+            current != &pfn_modified_list) {
+
+            pfn_metadata * meta = (pfn_metadata *) current;
+            // Mark as writing to disk
+            meta->write_in_progress = 1;
+
+            // Add to the array of pages to write to disk and increment counter
+            pages_to_write[num_pages_written++] = meta;
+
+            // Set next page
+            current = current->Flink;
+        }
+
+        LeaveCriticalSection (&pfn_lock);
+
+        write_to_disk(num_pages_written, pages_to_write);
+
+        EnterCriticalSection (&pfn_lock);
+
+        // Determine the pfn_state of each page written to disk based on the write_in_progress bit
+        // Specifically watching out for a soft fault that happened during the write to disk
+        for (int i = 0; i < num_pages_written; i++) {
+            // Iterate through each entry
+            pfn_metadata * meta = (pfn_metadata *) pages_to_write[i];
+
+            // Check if the write in progress is invalid, meaning there was a soft fault
+            if (meta->write_in_progress == 0) {
+                // Disc slot no longer needed and stale
+                empty_disc_slot(meta->disc_index);
+            }
+            // Or the page was successfully written in disk and now trasitioning to disk state
+            else {
+                RemoveEntryList (&meta->list);
+                modified_list_count--;
+
+                meta->write_in_progress = 0;
+                // In disk state
+                meta->isOccupied = 3;
+
+                // Move the page into the disk linked list and update counter
+                standby_list_count++;
+                InsertTailList (&pfn_standby_list, &meta->list);
+            }
+        }
+        LeaveCriticalSection (&pfn_lock);
+        // Tell the get_free_page function that there are now standby lists ready if needed
+        SetEvent(pages_available);
+    }
+
+    return 0;
 }
 
 BOOL
@@ -715,6 +1089,19 @@ initialize_system() {
     InitializeListHead (&pfn_free_list);
     InitializeListHead (&pfn_modified_list);
     InitializeListHead (&pfn_standby_list);
+
+    // Initialize the multithreading locks
+    InitializeCriticalSection(&pfn_lock);
+    InitializeCriticalSection (&pte_lock);
+    InitializeCriticalSection(&disc_lock);
+
+    // MULTITHREADING TESTER
+    // manual-reset=NULL, starts unsignaled=FALSE
+    shutdown_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (shutdown_event == NULL) {
+        printf("CreateEvent failed: %u\n", GetLastError());
+        return FALSE;
+    }
 
     //
     // Allocate the physical pages that we will be managing.
@@ -776,13 +1163,13 @@ initialize_system() {
                 NUMBER_OF_PHYSICAL_PAGES);
 
         if (physical_page_count == 0) {
-            printf ("Recieved no pages");
+            printf ("Recieved no pages\n");
             return FALSE;
         }
     }
 
     // Initializing the pfn_metadata and adding it to the free_list
-    setup_pfn_table(physical_page_numbers);
+    setup_pfn_table(physical_page_numbers, physical_page_count);
 
     //
     // Reserve a user address space region using the Windows kernel
@@ -796,7 +1183,7 @@ initialize_system() {
     //
 
     // Allocate memory for our disk
-    page_file_base = create_page_file(&disc_page_count);
+    official_disc = create_page_file(&disc_page_count);
 
     // Calculate the size of our virtual memory space based on the physical pages (memory + disk) available
     virtual_address_size = (physical_page_count + disc_page_count - 1) * PAGE_SIZE;
@@ -805,6 +1192,8 @@ initialize_system() {
     virtual_address_size &= ~(PAGE_SIZE);
     virtual_address_size_in_unsigned_chunks = virtual_address_size / sizeof (ULONG_PTR);
 
+    // Initialize the bit map that track a pages's occupancy
+    written = zero_malloc(virtual_address_size_in_unsigned_chunks);
 // Multiple VA
 #if SUPPORT_MULTIPLE_VA_TO_SAME_PAGE
 
@@ -818,7 +1207,6 @@ initialize_system() {
     parameter.Type = MemExtendedParameterUserPhysicalHandle;
     parameter.Handle = physical_page_handle;
 
-    // TODO: review these many parameters
     va_space_start = VirtualAlloc2 (NULL,
                        NULL,
                        virtual_address_size,
@@ -828,6 +1216,22 @@ initialize_system() {
                        &parameter,
                        1);
 
+    MEM_EXTENDED_PARAMETER sys_param = { 0 };
+
+    sys_param.Type = MemExtendedParameterUserPhysicalHandle;
+    sys_param.Handle = physical_page_handle;
+
+    system_va_start = VirtualAlloc2(
+        NULL, NULL,
+        WRITE_BATCH_SIZE  * PAGE_SIZE,  // One slot per possible PFN
+        MEM_RESERVE | MEM_PHYSICAL,
+        PAGE_READWRITE,
+        &sys_param, 1);
+
+    if (system_va_start == NULL) {
+        printf("Could not allocate system VA\n");
+        return FALSE;
+    }
 #else
 
     va_space_start = VirtualAlloc (NULL,
@@ -855,6 +1259,7 @@ initialize_system() {
     return TRUE;
 }
 
+// Calling function needs to hold the pte_lock
 BOOL
 handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta, ULONG_PTR * official_pfn) {
     // Get the pfn from the pte
@@ -870,9 +1275,35 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
         return FALSE;
     }
 
+    // Need the pfn_lock if editing the data
+    EnterCriticalSection(&pfn_lock);
+
+    // If the disc is currently being written to disc
+    if (meta->write_in_progress == 1) {
+        printf("Soft faulted while page is being written to disk.\n");
+
+        // Can update the write_in_progress bit about the soft fault so the disc can later empty the stale slot
+        meta->write_in_progress = 0;
+    }
+
+    // Check if page is in standby used to trigger empty disc slot after releasing the lock
+    BOOL was_standby = (meta->isOccupied == 3);
+
     // Remove the page from the standby/modified list
     RemoveEntryList (&meta->list);
 
+    // Update the counter
+    if (was_standby) {
+        standby_list_count--;
+    } else {
+        // There was a soft fault from the modified list count
+        modified_list_count--;
+    }
+    // Release the lock
+    LeaveCriticalSection(&pfn_lock);
+
+    // Update the pfn metadata; Lock-free because the page is removed from global lists and isOccupied is already TRUE
+    activate_page(pte, meta, pfn);
 
     // Is it not already mapped; therefore, we only need to mark it as valid?
     if (MapUserPhysicalPages (aligned_va, 1, &pfn) == FALSE) {
@@ -881,27 +1312,56 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
         return FALSE;
     }
 
-    // Check if page is in standby
-    if (meta->isOccupied == 3) {
+    // printf("[Thread %d] SOFT FAULT mapped VA %p to PFN %llx\n", my_thread_id, (void*)aligned_va, (unsigned long long)pfn);
+
+    if (was_standby) {
         // Clean our disc metadata
         empty_disc_slot(meta->disc_index);
     }
 
-    num_soft_fault++;
+    my_soft_faults++;
 
     // Using the addresses of the official metadata and pfn-update it's contents
     *official_meta = meta;
     *official_pfn = pfn;
+
     return TRUE;
 }
 
+// Calling function needs to hold the pte_lock
 BOOL
 handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta, ULONG_PTR * official_pfn) {
     // This a zero PTE or a disc PTE
     // Find a free physical page in memory
     pfn_metadata * meta = get_free_page();
+
+    // If we return NULL, we did not get a free page so try again
+    while (meta == NULL) {
+        // Release the pte lock to allow the trim thread to work
+        LeaveCriticalSection(&pte_lock);
+
+        // Wait for the trim to finish
+        WaitForSingleObject(pages_available, INFINITE);
+        // Reset the event
+        ResetEvent(pages_available);
+
+
+        EnterCriticalSection(&pte_lock);
+
+        // Check if another thread edited the pte to be valid or in transition. If so, punt
+        if (pte->hardware.valid == 1 || pte->transition.transition == 1) {
+            return FALSE;
+        }
+
+        meta = get_free_page();
+
+    }
+
     // Get the frame number of the free page using pointer arithmetic
     ULONG_PTR pfn = find_frame_number_from_pfn((meta));
+
+    // Update the pfn metadata; Lock-free because the page is removed from global lists and isOccupied is already TRUE
+    activate_page(pte, meta, pfn);
 
     // Map the VA to the physical page
     if (MapUserPhysicalPages (aligned_va, 1, &pfn) == FALSE) {
@@ -910,14 +1370,24 @@ handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
         return FALSE;
     }
 
+    // printf("[Thread %d] HARD FAULT mapped VA %p to PFN %llx\n", my_thread_id, (void*)aligned_va, (unsigned long long)pfn);
+
     // If the pte was in disc state
     if (pte->disc.disc == 1) {
         // Give the pte is in disc state, it stores the disc index
         ULONG_PTR slot_on_disc = pte->disc.disc_index;
+
+        // Check if slot_on_disc is an invalid disc address
+        if (slot_on_disc >= disc_page_count) {
+            printf("In handle hard fault: the slot_on_disc is invalid%llu\n", (unsigned long long)slot_on_disc);
+            DebugBreak();
+            return FALSE;
+        }
+
         // Use memcpy to copy the data in the disc into the free page in memory
-        memcpy(aligned_va, (char*)page_file_base + slot_on_disc * PAGE_SIZE, PAGE_SIZE);
+        memcpy(aligned_va, (char*)official_disc + slot_on_disc * PAGE_SIZE, PAGE_SIZE);
         // Mark the data in the disc slot to be invalid
-        disc_metadata[slot_on_disc] = FALSE;
+        empty_disc_slot(slot_on_disc);
     } else {
         // Zeros the page if new
         memset(aligned_va, 0, PAGE_SIZE);
@@ -932,49 +1402,124 @@ handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
     //     }
     // }
     // // TODO: break into functions
-    num_hard_fault++;
+    my_hard_faults++;
 
     *official_meta = meta;
     *official_pfn = pfn;
+
     return TRUE;
 }
 
 VOID
-print_stats(unsigned i) {
-    printf ("full_virtual_memory_test : finished accessing %u random virtual addresses\n", i);
-    printf("Soft fault: %u \n", num_soft_fault);
-    printf("Hard fault: %u \n", num_hard_fault);
-    printf("Repurpose: %u \n", num_repurpose);
+check_accuracy() {
+    printf("Checking the accuracy of stamped data\n");
+    int num_corrupt_page = 0;
+
+    for (int i = 0; i < virtual_address_size_in_unsigned_chunks; i++) {
+        PULONG_PTR va = va_space_start + i;
+        ULONG_PTR value;
+
+        // If the page holds a value, it would be its own va
+        // If the page does not hold a value, it is zeroed out
+        ULONG_PTR expected_value = written[i] ? (ULONG_PTR) va : 0;
+        BOOL checked_page_value = FALSE;
+
+        while (checked_page_value == FALSE) {
+            BOOL faulted = FALSE;
+            __try {
+                value = *va;
+                checked_page_value = TRUE;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                faulted = TRUE;
+            }
+
+            // Do my if faulted logic flow
+            if (faulted) {
+                EnterCriticalSection(&pte_lock);
+                PPTE pte = get_pte_from_va(va);
+
+                // Already mapped, leave
+                if (pte->hardware.valid == 1) {
+                    LeaveCriticalSection(&pte_lock);
+                    continue;
+                }
+
+                pfn_metadata *meta;
+                ULONG_PTR pfn;
+                PULONG_PTR aligned_va = get_va_from_pte(pte);
+                BOOL resolved;
+
+                if (pte->transition.transition == 1) {
+                    resolved = handle_soft_fault(pte, aligned_va, &meta, &pfn);
+                } else {
+                    resolved = handle_hard_fault(pte, aligned_va, &meta, &pfn);
+                }
+
+                if (resolved == FALSE) {
+                    LeaveCriticalSection(&pte_lock);
+                    continue;
+                }
+                set_pte_valid(pte, pfn);
+                LeaveCriticalSection(&pte_lock);
+            }
+        }
+
+        // Check if the values are matching
+        if (value != expected_value) {
+            printf("Data accuracy failed at slot %llu where va %p: holds %llx, expected %llx\n",
+                   (unsigned long long) i, va,
+                   (unsigned long long) value, (unsigned long long) expected_value);
+            num_corrupt_page++;
+        }
+    }
+
+    // Print finl statisstics
+    if (num_corrupt_page == 0) {
+        printf("Check accuracy is all good.\n");
+    } else {
+        printf("Check accuracy failed %d corrput\n", num_corrupt_page);
+        DebugBreak();
+    }
 }
 
 VOID
 cleanup() {
+    // Delete the multithreading locks
+    DeleteCriticalSection(&pfn_lock);
+    DeleteCriticalSection(&pte_lock);
+    DeleteCriticalSection(&disc_lock);
+
     //
     // Now that we're done with our memory we can be a good
     // citizen and free it.
     //
     VirtualFree (va_space_start, 0, MEM_RELEASE);
+    VirtualFree(system_va_start, 0, MEM_RELEASE);
 }
 
-VOID
-// Level 3: only level that touches upon the PA, i.e., physical pages
+// Return type: DWORD (unsigned int (32 bit)) WINAPI (set of rules that tells compiler how to push variables into stack)
+DWORD WINAPI
 // Program manually controls physical pages. Manage a group of physical pages, connect/disconnect to VA
 full_virtual_memory_test (
-    VOID
+    LPVOID thread_id // Pass a blank pointer
     )
 {
     unsigned i;
     PULONG_PTR arbitrary_va;
     unsigned random_number;
     BOOL page_faulted;
+    BOOL fault_resolution = TRUE;
+    int successful_accesses = 0;
 
-    if (initialize_system() == FALSE) {
-        printf("Initialization failed");
-        DebugBreak();
-        return;
-    }
-
-    for (i = 0; i < MB (1) / 100; i += 1) {
+    // Save the thread_id
+    int curr_thread = (int)(intptr_t)thread_id;
+    // Store it into the global variable
+    my_thread_id = curr_thread;
+#if DEBUG
+    while (1) {
+#else
+    for (i = 0; i < MB(1)/10; i += 1) {
+#endif
         //
         // Randomly access different portions of the virtual address
         // space we obtained above.
@@ -990,22 +1535,24 @@ full_virtual_memory_test (
         // (without faulting to the operating system again).
         //
 
-        // Gives a truly more random number
-        random_number = rand () * rand () * rand ();
+        // If the arbitrary VA is empty or successfully stamped, generate the next arbitrary VA
+        if (fault_resolution == TRUE) {
+            // Gives a truly  random number
+            random_number = rand () * rand () * rand ();
 
-        random_number %= virtual_address_size_in_unsigned_chunks;
+            random_number %= virtual_address_size_in_unsigned_chunks;
 
-        //
-        // Ensure the write to the arbitrary virtual address doesn't
-        // straddle a PAGE_SIZE boundary just to keep things simple for
-        // now.
-        //
+            //
+            // Ensure the write to the arbitrary virtual address doesn't
+            // straddle a PAGE_SIZE boundary just to keep things simple for
+            // now.
+            //
 
-        // Clears the low 3 bits, ensure random address is 8 byte
-        random_number &= ~0x7;
-        // Set up mock virtual address
-        arbitrary_va = va_space_start + random_number;
-
+            // Clears the low 3 bits, ensure random address is 8 byte
+            random_number &= ~0x7;
+            // Set up mock virtual address
+            arbitrary_va = va_space_start + random_number;
+        }
 
         page_faulted = FALSE;
 
@@ -1013,23 +1560,34 @@ full_virtual_memory_test (
         __try {
             // Stamping the page which is useful for the check
             *arbitrary_va = (ULONG_PTR) arbitrary_va;
+            // Update the page's bit map occupancy
+            written[arbitrary_va - va_space_start] = 1;
+
+            successful_accesses++;
+            // Mark the arbitrary VA as successfully mapped
+            fault_resolution = TRUE;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             // Flag page fault
             page_faulted = TRUE;
         }
 
         if (page_faulted) {
+            // If page faulted, we want to redo this iteration to confirm succesfully mapping
+            i--;
+
+            EnterCriticalSection(&pte_lock);
+
             // Get the PTE
             PPTE pte = get_pte_from_va(arbitrary_va);
 
-            // Check if valid state
+            // During multithreading, this check prevents a thread from repeating the mapping process done by another thread
             if (pte->hardware.valid == 1) {
+                LeaveCriticalSection(&pte_lock);
                 continue;
             }
 
             pfn_metadata * meta;
             ULONG_PTR pfn;
-            BOOL fault_resolution;
             PULONG_PTR aligned_va = get_va_from_pte(pte);
 
             // Check if in transition state (pfn is in modified or standby)
@@ -1044,20 +1602,27 @@ full_virtual_memory_test (
             }
 
             if (fault_resolution == FALSE) {
-                printf("Hard fault and Soft fault failed");
-                DebugBreak();
-                return;
+                printf("The page fault resolution failed. Try again.\n");
+                // If the page did not get resolved, we will page fault again to try to resolve
+                LeaveCriticalSection(&pte_lock);
+                // Try again, meaning i never increments
+                i--;
+                continue;
             }
 
-            //Set pte valid and update the pfn metadata
-            activate_page(pte, meta, pfn);
+            set_pte_valid(pte, pfn);
+            LeaveCriticalSection(&pte_lock);
         }
     }
 
-    print_stats(i);
+    // Save the thread's totals into global array
+    final_results[curr_thread].thread_id = curr_thread;
+    final_results[curr_thread].hard_faults = my_hard_faults;
+    final_results[curr_thread].soft_faults = my_soft_faults;
+    final_results[curr_thread].repurpose_faults = my_repurpose_faults;
+    final_results[curr_thread].total_accesses = successful_accesses;
 
-    cleanup();
-    return;
+    return 0;
 }
 
 int
@@ -1066,7 +1631,6 @@ main (
     char** argv
     )
 {
-
 
     //
     // Test our very complicated usermode virtual implementation.
@@ -1092,75 +1656,122 @@ main (
     // This is where we can be as creative as we like, the sky's the limit !
     //
 
-    full_virtual_memory_test ();
+    if (initialize_system() == FALSE) {
+        printf("Initialization failed\n");
+        DebugBreak();
+        return 0;
+    }
 
+    // Set up the events
+    trim_needed = CreateEvent(NULL, FALSE, FALSE, NULL);
+    write_needed = CreateEvent(NULL, FALSE, FALSE, NULL);
+    pages_available = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    // Trim Thread
+    HANDLE trim_thread_handle  = CreateThread(NULL, 0, trim_thread, NULL, 0, NULL);
+
+    HANDLE write_thread_handle = CreateThread(NULL, 0, write_thread, NULL, 0, NULL);
+
+    HANDLE thread_handles[NUM_THREADS];
+    DWORD thread_ids[NUM_THREADS];
+
+    // Iterate through each thread to call createThread and store in array
+    for (int i = 0; i < NUM_THREADS; i++) {
+        thread_handles[i] = CreateThread (NULL, 0, full_virtual_memory_test,
+            // Pass the loop variable i which is the thread's ID. i is 32 bit but return type is 64;
+            // therefore, the intptr_t stretches i into a 64-bit int. LPVOID labels the value as a memory address
+            (LPVOID)(intptr_t) i,
+            0, &thread_ids[i]);
+
+        if (thread_handles[i] == NULL) {
+            printf("Error creating thread %d\n", i);
+        }
+    }
+
+    // TODO: create individual thread for trimming
+
+    // Wait indefinetly for all worker threads to complete
+    DWORD wait_result = WaitForMultipleObjects (NUM_THREADS, thread_handles, TRUE, INFINITE);
+
+    check_accuracy();
+
+    if (wait_result == WAIT_FAILED) {
+        printf("WaitForMultipleObjects failed\n");
+    } else {
+        printf("WaitForMultipleObjects succeeded\n");
+    }
+
+    // Tell all background threads to stop
+    SetEvent(shutdown_event);
+
+    // Wait for the background threads to exit
+    WaitForSingleObject(write_thread_handle, INFINITE);
+    WaitForSingleObject(trim_thread_handle, INFINITE);
+
+    // Close all thread handles and print out their stats
+    for (int i = 0; i < NUM_THREADS; i++) {
+        CloseHandle(thread_handles[i]);
+    }
+
+    // Close background thread handles
+    CloseHandle(trim_thread_handle);
+    CloseHandle(write_thread_handle);
+
+    // Close events
+    CloseHandle(trim_needed);
+    CloseHandle(write_needed);
+    CloseHandle(pages_available);
+    CloseHandle(shutdown_event);
+
+    // Print Stats
+    printf("\nRESULTS\n");
+    for (int i = 0; i < NUM_THREADS; i++) {
+        printf("Thread %d:\n", i);
+        printf ("full_virtual_memory_test : finished accessing %u random virtual addresses\n", final_results[i].total_accesses);
+        printf("Hard Faults: %d\n", final_results[i].hard_faults);
+        printf("Soft-Faults: %d\n", final_results[i].soft_faults);
+        printf("Repurpose Faults: %d\n", final_results[i].repurpose_faults);
+        printf("\n");
+    }
+
+    cleanup();
     return 0;
 }
 
-                        // TODO: DISK
-                        // 1. Update the PTE from valid to transition (Soft Fault: transition bit in PTE)
-                        // 2. Put the PFN onto an array to write to disk (essentially, batch a bunch to go to disk)
-                        // 2. Finding the page data that we want to bring to disk, looking at PFN metadata
-                        // *Flink blink: chain through the PFN in any order
-                        // Linear walk: For loop that iterates through looking at the bit
-                        // Array to keep track of
-                        // 3. write to disk: memCopy. In PFN metadata, store disk address.
-                        // 4. move PFN from modified to standby list: inc/dec counter
-                        // 5a. If soft fault (same VA/frame number): move from modified/standby list and valid bit in PTE
-                        // and transition bit is 0. Map.
-                        // 5b. repurposed PFN: modify old PTE from transition bit to 0 and disk bit to 1 and modify old PTE
-                        // PFN to a disk address. And Map new stuff.
+// TODO:
+// Create a free list of empty disc slot
+    // a) create a disc struct and linked list
+    // b) create a stack struct and use a stack that tracks the indicies of empty disc array slots
+// Create target functions
+    // create target functions
+    // faulting and the arbitrary function
+    // aging
+    // trimming
+    // modified page writing
 
-                        // Disk states (may disk retrieval) (keep a free list for this)
-                        // 1. Valid
-                        // 2. Not valid (don't read) (soft fault afterwards)
+// TODO: DISK
+// 1. Update the PTE from valid to transition (Soft Fault: transition bit in PTE)
+// 2. Put the PFN onto an array to write to disk (essentially, batch a bunch to go to disk)
+// 2. Finding the page data that we want to bring to disk, looking at PFN metadata
+// *Flink blink: chain through the PFN in any order
+// Linear walk: For loop that iterates through looking at the bit
+// Array to keep track of
+// 3. write to disk: memCopy. In PFN metadata, store disk address.
+// 4. move PFN from modified to standby list: inc/dec counter
+// 5a. If soft fault (same VA/frame number): move from modified/standby list and valid bit in PTE
+// and transition bit is 0. Map.
+// 5b. repurposed PFN: modify old PTE from transition bit to 0 and disk bit to 1 and modify old PTE
+// PFN to a disk address. And Map new stuff.
 
-                        // Four States of PTE (pfn, d, t, v)
-                        // 1. Zero: (0,0,0,0)
-                        // 2. Valid: (pfn,0,0,1)
-                        // 3. Transition: (pfn, 0, 1, 0) In which the PFN can go from modified to standby
-                        // also, in substate: possibility that the page is written to disk when switching PFN states
-                        // a. can go soft fault
-                        // b. can go to disk
-                        // 4. Disk format (only in disk!) (disk index,1,0,0): page is repurposed from standby list
+// TODO: QUESTIONS
+// currently, pte_lock is global, how do i resolve it?
+    // I was thinking about doing a lock for each virtual address, and with some research, i found a hashing strategy
+    // what are some other technique
+// add a disc lock
 
-                        // States in PFN Metadata/Three type of list (optional)
-                        // 1. free list: free page
-                        // 2. active list (not mL compatible)
-                        // 3. been modified by user list: pages that need to be written to disk
-                        // Still transition state in pte; it means that v = 0, t = 1 but only stored in pages
-                        // 4. standby list: list of pages already in disk
-                        // Still transititon state in pte; it means that v = 0, t = 1 but stored in both pages and disk
-                        // Length of list: invaluable information regarding trimming amount, batching, etc...
+// wait what happens with a lock inside a lock wtf
 
-                        // TODO: pretend disk is an array (malloc)
-
-                        // TODO: add a state instance variable into the struct (2 bits) for four different state values
-                        // Update the PTE to reflect the disk address
-                        // TODO: get rid of this
-
-// Stores our VA to the array
-// physical_page_to_virtual[i] = (ULONG_PTR) arbitrary_va;
-// Second Way: i advances based on data type
-// *(physical_page_to_virtual + i) = (ULONG_PTR) arbitrary_va;
-
-//
-// Unmap the virtual address translation we installed above
-// now that we're done writing our value into it.
-//
-
-// Generally, we want to overwrite the oldest-created page, but given that our scenario of values is random
-// The most general, and easy solution is constantly replacing the newest-created page
-// In order to get the VA, we want the: VA BASE + i * 4K
-// Regarding efficiency, unmapping takes a lot of energy compared to mapping and general areas
-// Therefore, the goal is to unmap as match as possible in one go
-// One solution: Scatter function: unmap the parameter which is an array of VAs
-
-// Unmap the most recent created page
-// Essentially: *(physical_page_to_virtual + i) is physical_page_to_virtual[i]
-// Parameter type is PVOID; therefore, we cast and there is no issue given both pointers
-
-// Xperf Cheat Sheet
-// xperf -on base -stackwalk profile
-// run your vmtest.exe
-// xperf -top -d trace1.etl
+// for getting a free disk page: which currently uses an array of booleans as its metadata
+    // should i create a stack of free indicies
+    // should i create a struct and linked list (will we add anything later on?)
+// ask about the trim_pages with one thread
