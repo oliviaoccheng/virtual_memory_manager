@@ -252,7 +252,6 @@ HANDLE pages_available;
 
 // Locks for multi-threading
 CRITICAL_SECTION pfn_lock;
-CRITICAL_SECTION pte_lock;
 CRITICAL_SECTION disc_lock;
 
 ULONG_PTR virtual_address_size_in_unsigned_chunks;
@@ -304,6 +303,8 @@ typedef struct {
         VALID_PTE hardware;
         TRANSITION_PTE transition;
         DISC_PTE disc;
+        // Include a pointer to the entire PTE; TODO/
+        ULONG_PTR entire;
     };
 } PTE, *PPTE;
 
@@ -315,6 +316,21 @@ PULONG_PTR va_space_start;
 // Pointer to the start of the space allocated for the system virtual address
 // Used specifically for mapping page's data to the disk
 PULONG_PTR system_va_start;
+
+// Define our PTE section struct
+# define NUM_PTE_SECTIONS 64
+#define NUM_AGES 8
+
+typedef struct {
+    CRITICAL_SECTION lock;
+    LIST_ENTRY age_lists[NUM_AGES];
+    int age_counts[NUM_AGES];
+} PTE_SECTION;
+
+// Pointer to the array of pte_sections
+PTE_SECTION *pte_sections;
+// Number of PTEs per section
+ULONG_PTR ptes_per_section;
 
 // Increment age unless age equals the maximum of 7; therefore, it remains the same
 VOID
@@ -380,15 +396,27 @@ get_va_from_pte(PPTE pte) {
     return va_space_start + (pte_index * (PAGE_SIZE / sizeof (ULONG_PTR)));
 }
 
+// Return the PTE section the inputted pte belongs to
+PTE_SECTION *
+    get_section(PPTE pte) {
+    ULONG_PTR index = (ULONG_PTR) (pte - page_table);
+    return &pte_sections[index/ptes_per_section];
+}
 // TODO: need a lock!
-// Set the frame number to the physical page and set valid bit to 1
+// Set the frame number to the physical page, set valid bit to 1, and update aging lists and counter
+// Need to be called with a lock
 VOID
-set_pte_valid(PPTE pte, ULONG_PTR frame_number) {
+set_pte_valid(PTE_SECTION * section, pfn_metadata * meta, PPTE pte, ULONG_PTR pfn) {
     // Set new frame number
-    pte->hardware.frame_number = frame_number;
+    pte->hardware.frame_number = pfn;
     // Reset hardware age
     pte->hardware.age = 0;
     pte->hardware.valid = TRUE;
+
+    // Add pte into the smallest, hottest age list (i.e. 0) in its corresponding section
+    InsertTailList(&section->age_lists[0], &meta->list);
+    // Update the PTE section's age count
+    section->age_counts[0]++;
 }
 
 // Set valid bit to 0, but leave the physical page linked in case we want to retrieve the data
@@ -555,6 +583,35 @@ find_frame_number_from_pfn(pfn_metadata *pfn) {
     return (ULONG_PTR) (pfn - pfn_table);
 }
 
+VOID
+age_pages() {
+    // Iterate through each PTE section
+    for (int i = 0; i < NUM_PTE_SECTIONS; i++) {
+        PTE_SECTION * section =  &pte_sections[i];
+        EnterCriticalSection(&section->lock);
+
+        // Iterate through the PTE's in each section from oldest to youngest
+        // Except skip the oldest age bucket, which stands as the ceiling
+        for (int age = NUM_AGES - 2; age >= 0; age--) {
+            // Iterate through each page in the age bucket and age each PTE by one
+            while (section->age_counts[age] > 0) {
+                // Remove and store the pointer to the head of the current age linked list
+                pfn_metadata * pfn = (pfn_metadata *) RemoveHeadList(&section->age_lists[age]);
+                section->age_counts[age]--;
+
+                // Update the PTE age field by one
+                pfn->pte->hardware.age = age + 1;
+
+                // Put it into the next age bucket (age + 1)
+                InsertTailList(&section->age_lists[age + 1], &pfn->list);
+                section->age_counts[age + 1]++;
+            }
+        }
+
+        LeaveCriticalSection(&section->lock);
+    }
+}
+
 
 BOOL
 // Grants a Windows security privilege that permits calling certain methods (i.e. AllocateUserPhysicalPages)
@@ -702,73 +759,74 @@ trim_pages () {
 
     LeaveCriticalSection(&pfn_lock);
 
-    ULONG_PTR count = physical_page_count;
+    int total_pages_trimmed = 0;
+    int curr_section = 0;
 
-    PULONG_PTR va_to_unmap[NUMBER_OF_PHYSICAL_PAGES / 2];
-    int num_pages_unmapped = 0;
+    // Iterate through each section, holding its own lock at a time
+    while (curr_section < NUM_PTE_SECTIONS && total_pages_trimmed < TRIM_BATCH_SIZE) {
+        // Find pointer to curr_section
+        PTE_SECTION * section = &pte_sections[curr_section];
+        // Initialize array to keep track of pages to trim
+        pfn_metadata * trimmed_pages[TRIM_BATCH_SIZE];
+        PVOID trimmed_pages_vas[TRIM_BATCH_SIZE];
+        // Keep track of how many pages trimmed in this section
+        int sec_pages_trimmed = 0;
 
-    // Iterate through the pfn_metadata to find the oldest pages
-    while (num_pages_unmapped < TRIM_BATCH_SIZE) {
-        printf("Entered trim_pages\n");
-        pfn_metadata * oldest_pfn = NULL;
-        ULONG_PTR highest_age = 0;
+        EnterCriticalSection(&section->lock);
 
-        // TODO: create a local array of age counts of 8, set everything to 0
-        // TODO: index (age) and contents (num of that age)
-        // TODO: make global variable and make function to keep update
-        for (int j = 0; j < NUMBER_OF_PHYSICAL_PAGES; j += 1) {
-            ULONG_PTR frame_number = physical_page_numbers[j];
-            // Get the physical metadata frame number's address
-            pfn_metadata * pfn = &pfn_table[frame_number];
+        // Iterate through the age lists by oldest/coldest page to youngest/hottest page
+        int age = NUM_AGES - 1;
+        // Continue iterating while the number of pages trimmed is less than the batch size
+        while (age >= 0 && total_pages_trimmed + sec_pages_trimmed < TRIM_BATCH_SIZE) {
+            // Iterate through the current oldest age bucket and pop off as many pages as needed
+            while (section->age_counts[age] > 0 && total_pages_trimmed + sec_pages_trimmed < TRIM_BATCH_SIZE) {
+                // Pop the head of the current age list and store the pointer to its pfn_metadata
+                pfn_metadata * trim_page = (pfn_metadata *) RemoveHeadList(&section->age_lists[age]);
 
-            if (pfn->isOccupied == 1 && pfn->pte->hardware.age >= highest_age) {
-                highest_age = pfn->pte->hardware.age;
-                oldest_pfn = pfn;
+                // Update the counter on the number of items of the linked list
+                section->age_counts[age]--;
+
+                // Get the pte of the trimmed page and store it in the array of trimmed page's VA
+                PPTE pte = trim_page->pte;
+                trimmed_pages_vas[sec_pages_trimmed] = get_va_from_pte(pte);
+
+                // Invalidate the pte
+                set_pte_invalid(pte);
+                // Update the pte to transition state
+                pte->transition.transition = 1;
+                pte->transition.frame_number = find_frame_number_from_pfn(trim_page);
+
+                trimmed_pages[sec_pages_trimmed] = trim_page;
+
+                sec_pages_trimmed++;
             }
+
+            // Move on to the next largest age
+            age--;
         }
 
-        // Edge Case: if nothing is found
-        if (oldest_pfn == NULL) {
-            break;
+        if (sec_pages_trimmed > 0) {
+            // While holding the section's lock, unmap the batch before another thread accesses it
+            if (MapUserPhysicalPagesScatter(trimmed_pages_vas, sec_pages_trimmed, NULL) == FALSE) {
+                printf("TRIM_PAGES: scatter unmapped failed\n");
+            }
+
+            // Update the trimmed_pages to the modified status
+            EnterCriticalSection(&pfn_lock);
+            for (int i = 0; i < sec_pages_trimmed; i++) {
+                trimmed_pages[i]->isOccupied = 2;
+                // Add onto modified list
+                InsertTailList(&pfn_modified_list, &trimmed_pages[i]->list);
+                modified_list_count++;
+            }
+            LeaveCriticalSection(&pfn_lock);
+
+            total_pages_trimmed += sec_pages_trimmed;
         }
 
-        // TODO: ideas for efficiency--not n^2
-        // 1. memory v. CPU power: keeping an array of 100 instead of 500
-        // 2. chain together: buckets for each age
-        // Possible edge case: if oldest_slot never changes
+        LeaveCriticalSection(&section->lock);
 
-        // Add the oldest page to the array of VA's that will be unmapped
-        PPTE remove_pte = oldest_pfn->pte;
-        va_to_unmap[num_pages_unmapped] = get_va_from_pte(remove_pte);
-        num_pages_unmapped++;
-
-        EnterCriticalSection(&pte_lock);
-
-        // Update the pfn_metadata and pte
-        set_pte_invalid(remove_pte);
-        remove_pte->transition.transition = 1;
-        // TODO: why do i have to reset the frame number? is it not already correct
-        remove_pte->transition.frame_number = find_frame_number_from_pfn(oldest_pfn);
-
-        LeaveCriticalSection(&pte_lock);
-
-        EnterCriticalSection(&pfn_lock);
-        oldest_pfn->isOccupied = 2;
-        // Add the pfn into the modified list
-        printf("insert into modified liest\n");
-        InsertTailList(&pfn_modified_list, &oldest_pfn->list);
-        modified_list_count++;
-        printf("modified list count in trim pages: %d\n", modified_list_count);
-        LeaveCriticalSection(&pfn_lock);
-
-    }
-
-    // Batch unmap
-    // TODO: it doesn't batch unmap or a little confused what > 0 would suggest
-    if (num_pages_unmapped > 0) {
-        if (MapUserPhysicalPagesScatter((PVOID*)va_to_unmap, num_pages_unmapped, NULL) == FALSE) {
-            printf("trim_pages : scatter unmap failed\n");
-        }
+        curr_section++;
     }
 }
 
@@ -868,7 +926,7 @@ get_free_page() {
         new_pte_contents.disc.disc_index = meta->disc_index;
 
         // Update the contents of the pte
-        *old_pte = new_pte_contents;
+        old_pte->entire = new_pte_contents.entire;
 
         my_repurpose_faults++;
 
@@ -905,6 +963,9 @@ DWORD WINAPI
 trim_thread (LPVOID lpParam) {
     // Every 50 milliseconds, the thread wakes up unless the shutdown event is fired
     while (WaitForSingleObject (shutdown_event, 2) != WAIT_OBJECT_0) {
+        // Age every page by 1
+        age_pages();
+
         BOOL need_to_trim = FALSE;
 
         EnterCriticalSection (&pfn_lock);
@@ -1092,7 +1153,6 @@ initialize_system() {
 
     // Initialize the multithreading locks
     InitializeCriticalSection(&pfn_lock);
-    InitializeCriticalSection (&pte_lock);
     InitializeCriticalSection(&disc_lock);
 
     // MULTITHREADING TESTER
@@ -1256,6 +1316,35 @@ initialize_system() {
     // Initialize and reserve the space for the page table
     page_table = zero_malloc((virtual_address_size / PAGE_SIZE) * sizeof(PTE));
 
+    ULONG_PTR num_ptes = virtual_address_size / PAGE_SIZE;
+    // TODO: wtf is this calculation
+    ptes_per_section = (num_ptes + NUM_PTE_SECTIONS - 1) / NUM_PTE_SECTIONS;
+
+    // If integer division results in 0, only enough PTE's for one section
+    if (ptes_per_section == 0) {
+        ptes_per_section = 1;
+    }
+
+    // TODO: is this what it even means. Allocate memory for our pte_sections
+    pte_sections = malloc(NUM_PTE_SECTIONS * sizeof(PTE_SECTION));
+
+    // Check if we properly reserved memory
+    if (pte_sections == NULL) {
+        printf("in initialize_system, we failed to allocate PTE sections");
+        return FALSE;
+        DebugBreak();
+    }
+
+    // Iterate through each pte_section and initialize its respective lock
+    for (int i = 0; i < NUM_PTE_SECTIONS; i++) {
+        InitializeCriticalSection(&pte_sections[i].lock);
+
+        // Iterate through each pte_section's age lists to initilize list_heads and counters
+        for (int j = 0; j < NUM_AGES; j++) {
+            InitializeListHead(&pte_sections[i].age_lists[j]);
+            pte_sections[i].age_counts[j] = 0;
+        }
+    }
     return TRUE;
 }
 
@@ -1277,6 +1366,14 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
 
     // Need the pfn_lock if editing the data
     EnterCriticalSection(&pfn_lock);
+
+    // Check the status of the PTE after releasing the lock as another thread could have altered its contents/status
+    // If the PTE does not satisfy a soft fault, return to full_virtual memory to force another page fault and reroute
+    // to correct function that can resolve the fault
+    if (pte->transition.transition != 1 || pte->transition.frame_number != pfn) {
+        LeaveCriticalSection(&pfn_lock);
+        return FALSE;
+    }
 
     // If the disc is currently being written to disc
     if (meta->write_in_progress == 1) {
@@ -1331,14 +1428,16 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
 // Calling function needs to hold the pte_lock
 BOOL
 handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta, ULONG_PTR * official_pfn) {
+    PTE_SECTION *section = get_section(pte);
+
     // This a zero PTE or a disc PTE
     // Find a free physical page in memory
     pfn_metadata * meta = get_free_page();
 
     // If we return NULL, we did not get a free page so try again
     while (meta == NULL) {
-        // Release the pte lock to allow the trim thread to work
-        LeaveCriticalSection(&pte_lock);
+        // Release the pte section lock to allow the trim thread to work
+        LeaveCriticalSection(&section->lock);
 
         // Wait for the trim to finish
         WaitForSingleObject(pages_available, INFINITE);
@@ -1346,7 +1445,7 @@ handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
         ResetEvent(pages_available);
 
 
-        EnterCriticalSection(&pte_lock);
+        EnterCriticalSection(&section->lock);
 
         // Check if another thread edited the pte to be valid or in transition. If so, punt
         if (pte->hardware.valid == 1 || pte->transition.transition == 1) {
@@ -1435,12 +1534,15 @@ check_accuracy() {
 
             // Do my if faulted logic flow
             if (faulted) {
-                EnterCriticalSection(&pte_lock);
+                // Find pte and pte section
                 PPTE pte = get_pte_from_va(va);
+                PTE_SECTION * section = get_section(pte);
+
+                EnterCriticalSection(&section->lock);
 
                 // Already mapped, leave
                 if (pte->hardware.valid == 1) {
-                    LeaveCriticalSection(&pte_lock);
+                    LeaveCriticalSection(&section->lock);
                     continue;
                 }
 
@@ -1456,11 +1558,12 @@ check_accuracy() {
                 }
 
                 if (resolved == FALSE) {
-                    LeaveCriticalSection(&pte_lock);
+                    LeaveCriticalSection(&section->lock);
                     continue;
                 }
-                set_pte_valid(pte, pfn);
-                LeaveCriticalSection(&pte_lock);
+
+                set_pte_valid(section, meta, pte, pfn);
+                LeaveCriticalSection(&section->lock);
             }
         }
 
@@ -1486,9 +1589,15 @@ VOID
 cleanup() {
     // Delete the multithreading locks
     DeleteCriticalSection(&pfn_lock);
-    DeleteCriticalSection(&pte_lock);
     DeleteCriticalSection(&disc_lock);
 
+    if (pte_sections != NULL) {
+        // Iterate through the PTE sections to delete its own respective locks
+        for (int i = 0; i < NUM_PTE_SECTIONS; i++) {
+            DeleteCriticalSection(&pte_sections[i].lock);
+        }
+        pte_sections = NULL;
+    }
     //
     // Now that we're done with our memory we can be a good
     // citizen and free it.
@@ -1518,7 +1627,7 @@ full_virtual_memory_test (
 #if DEBUG
     while (1) {
 #else
-    for (i = 0; i < MB(1)/10; i += 1) {
+    for (i = 0; i < 1000; i += 1) {
 #endif
         //
         // Randomly access different portions of the virtual address
@@ -1575,14 +1684,16 @@ full_virtual_memory_test (
             // If page faulted, we want to redo this iteration to confirm succesfully mapping
             i--;
 
-            EnterCriticalSection(&pte_lock);
-
             // Get the PTE
             PPTE pte = get_pte_from_va(arbitrary_va);
+            // Find the PTE section lock
+            PTE_SECTION * section = get_section(pte);
+
+            EnterCriticalSection(&section->lock);
 
             // During multithreading, this check prevents a thread from repeating the mapping process done by another thread
             if (pte->hardware.valid == 1) {
-                LeaveCriticalSection(&pte_lock);
+                LeaveCriticalSection(&section->lock);
                 continue;
             }
 
@@ -1604,14 +1715,15 @@ full_virtual_memory_test (
             if (fault_resolution == FALSE) {
                 printf("The page fault resolution failed. Try again.\n");
                 // If the page did not get resolved, we will page fault again to try to resolve
-                LeaveCriticalSection(&pte_lock);
+                LeaveCriticalSection(&section->lock);
                 // Try again, meaning i never increments
                 i--;
                 continue;
             }
 
-            set_pte_valid(pte, pfn);
-            LeaveCriticalSection(&pte_lock);
+            // Update pte and pte section metadata
+            set_pte_valid(section, meta, pte, pfn);
+            LeaveCriticalSection(&section->lock);
         }
     }
 
