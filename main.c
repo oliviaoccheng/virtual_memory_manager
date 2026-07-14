@@ -102,17 +102,17 @@
 // MULTITHREADING HELPER FUNCTIONS
 // This is the function your threads will execute
 HANDLE shutdown_event;
-#define NUMBER_OF_PHYSICAL_PAGES 4096 // ((VIRTUAL_ADDRESS_SIZE / PAGE_SIZE) / 64)
-#define NUM_DISC_PAGES 4096 // (MB(2) / PAGE_SIZE)
+#define NUMBER_OF_PHYSICAL_PAGES (MB(64) / PAGE_SIZE) // ((VIRTUAL_ADDRESS_SIZE / PAGE_SIZE) / 64)
+#define NUM_DISC_PAGES (NUMBER_OF_PHYSICAL_PAGES * 4) // (MB(2) / PAGE_SIZE)
 
 // The bar we have to meet to trigger trimming measured by free+standby count
-#define TRIM_LOW_BAR (NUMBER_OF_PHYSICAL_PAGES / 8)
-#define EMERGENCY_LOW_BAR (NUMBER_OF_PHYSICAL_PAGES / 40)
+#define TRIM_LOW_BAR 400
+#define EMERGENCY_LOW_BAR 120
 // How many pages to trim per batch
-#define TRIM_BATCH_SIZE (NUMBER_OF_PHYSICAL_PAGES / 20)
+#define TRIM_BATCH_SIZE 240
 // Number of modified pages we want before writing to disk
 // Number can't exceed the disk size
-# define WRITE_BATCH_SIZE ((TRIM_BATCH_SIZE < NUM_DISC_PAGES) ? TRIM_BATCH_SIZE : NUM_DISC_PAGES)
+# define WRITE_BATCH_SIZE 240
 
 #define MAX_DISC_PTE_BITS 40
 
@@ -122,9 +122,10 @@ HANDLE shutdown_event;
 #define NUM_THREADS 4
 
 #define TICK_MS 500
+#define AGE_TICK_MS 250
 #define CHUNKS_PER_PAGE (PAGE_SIZE / sizeof(ULONG_PTR))
-// Create a bit map to track the occupancy of a page's data
-char *written;
+
+
 
 // List Head Primitives to build Linked Lists
 // Functions include: initialize, isListEmpty, insert, remove
@@ -134,7 +135,12 @@ char *written;
 // } LIST_ENTRY, *PLIST_ENTRY;
 
 
-#define DEBUG 0
+#define DEBUG 1
+#if DEBUG
+#define ASSERT(x) {if(!(x)) DebugBreak();}
+#else
+#define ASSERT(x)
+#endif
 VOID
 InitializeListHead (
     PLIST_ENTRY ListHead
@@ -221,6 +227,61 @@ RemoveEntryList (
     return (BOOLEAN) (Flink == Blink);
 }
 
+// Borrowed Noah's random function
+typedef struct {
+    ULONG_PTR state;
+    ULONG_PTR counter;
+} THREAD_RNG_STATE;
+
+// High-quality XOR shift generator
+ULONG64 GetNextRandom(THREAD_RNG_STATE *rng) {
+    ULONG64 x = rng->state;
+
+    // High-quality XOR shift with good statistical properties
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+
+    rng->state = x;
+    rng->counter++;
+
+    // Occasionally reseed with fresh entropy
+    if ((rng->counter & 0xFFFF) == 0) {
+        x ^= __rdtsc(); // Mix in fresh entropy periodically
+        rng->state = x;
+    }
+
+    return x;
+}
+
+// Initialize RNG state with non-deterministic seed
+VOID InitializeThreadRNG(THREAD_RNG_STATE *rng) {
+    LARGE_INTEGER perfCounter;
+    ULONG64 rdtsc = __rdtsc();
+    ULONG64 processId = GetCurrentProcessId();
+    ULONG64 threadId = GetCurrentThreadId();
+
+    QueryPerformanceCounter(&perfCounter);
+
+    // Combine multiple entropy sources for non-deterministic seed
+    rng->state = rdtsc ^ perfCounter.QuadPart ^
+                 (processId << 32) ^ (threadId << 16) ^
+                 ((ULONG64) rng << 8); // Use stack address as additional entropy
+
+    // Ensure state is never zero (would break XOR shift)
+    if (rng->state == 0) {
+        rng->state = 0x123456789ABCDEF1ULL;
+    }
+
+    rng->counter = 0;
+
+    // Warm up the generator to improve distribution
+    for (int i = 0; i < 32; i++) {
+        GetNextRandom(rng);
+    }
+}
+
+
 //
 // This define enables code that lets us create multiple virtual address
 // mappings to a single physical page.  We only/need want this if/when we
@@ -272,6 +333,7 @@ typedef struct {
     int soft_faults;
     int repurpose_faults;
     int total_accesses;
+    double elapsed_ms;
 } ThreadStats;
 
 // Create an array that demonstrates each thread's final results
@@ -361,7 +423,7 @@ typedef struct {
 VOID
 initialize_list_head(PLIST_HEAD head) {
     InitializeListHead(&head->entry);
-    InitializeCriticalSection(&head->lock);
+    InitializeCriticalSectionAndSpinCount(&head->lock, 0x00FFFFFF);
     head->size = 0;
 
     return;
@@ -567,11 +629,7 @@ setup_pfn_table(PULONG_PTR physical_page_numbers, ULONG_PTR physical_page_count)
     pfn_table = VirtualAlloc(NULL, pfn_table_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 
     // Check if the memory was successfully reserved
-    if (pfn_table == NULL) {
-        printf("Failed to reserve memory for the pfn_table/pfn metadata\n");
-        DebugBreak();
-        return;
-    }
+    ASSERT(pfn_table != NULL);
 
     // Commit the real physical pages by iterating through the physical page numbers and committing them
     for (int i = 0; i < physical_page_count; i++) {
@@ -594,6 +652,7 @@ pfn_metadata*
 // Based on the address of a pfn_entry, find the frame number using pointer arithmetic
 ULONG_PTR
 find_frame_number_from_pfn(pfn_metadata *pfn) {
+    ASSERT(pfn > pfn_table);
     return (ULONG_PTR) (pfn - pfn_table);
 }
 
@@ -626,6 +685,22 @@ age_pages() {
     }
 }
 
+
+DWORD WINAPI
+age_thread () {
+    while (TRUE) {
+        // Triggered by shut down or the routine time check
+        DWORD r = WaitForSingleObject(shutdown_event, AGE_TICK_MS);
+
+        // If shutdown, exit
+        if (r == WAIT_OBJECT_0) {
+            break;
+        }
+
+        // Do an aging pass
+        age_pages();
+    }
+}
 
 BOOL
 // Grants a Windows security privilege that permits calling certain methods (i.e. AllocateUserPhysicalPages)
@@ -768,7 +843,6 @@ trim_pages () {
     // TODO: SEVERAL LOCKS
     // If trim pages was unneccarily called, check if it is low or now
     if (pfn_standby_list.size + pfn_free_list.size >= TRIM_BATCH_SIZE) {
-        printf("trim pages entered, ofund pages avaialble\n");
         SetEvent(pages_available);
         LeaveCriticalSection(&pfn_free_list.lock);
         LeaveCriticalSection(&pfn_standby_list.lock);
@@ -999,22 +1073,10 @@ trim_thread (LPVOID lpParam) {
         // Mark if the trigger was a trim_needed event from a worker thread
         BOOL emergency = (r == WAIT_OBJECT_0);
 
-        age_pages();
-
         // Find the counts of each list to dictate the trimming/writing decisions
-        int modified, free, standby;
-
-        EnterCriticalSection(&pfn_modified_list.lock);
-        modified = pfn_modified_list.size;
-        LeaveCriticalSection(&pfn_modified_list.lock);
-
-        EnterCriticalSection(&pfn_free_list.lock);
-        free = pfn_free_list.size;
-        LeaveCriticalSection(&pfn_free_list.lock);
-
-        EnterCriticalSection(&pfn_standby_list.lock);
-        standby = pfn_standby_list.size;
-        LeaveCriticalSection(&pfn_standby_list.lock);
+        int modified = pfn_modified_list.size;
+        int free = pfn_free_list.size;
+        int standby = pfn_standby_list.size;
 
         // If there are sufficient modified pages, there is no need to unmap more physical pages
         // Instead to get free pages, only need to write the data to disk
@@ -1027,92 +1089,10 @@ trim_thread (LPVOID lpParam) {
             SetEvent(write_needed);
         }
     }
-    // Every 50 milliseconds, the thread wakes up unless the shutdown event is fired
-    while (WaitForSingleObject (shutdown_event, 10) != WAIT_OBJECT_0) {
-        // Age every page by 1
-        age_pages();
-
-        // If there are sufficient modified pages, don't need to trim; instead, need to write to disk
-        EnterCriticalSection(&pfn_modified_list.lock);
-        BOOL modified_sufficient = pfn_modified_list.size >= WRITE_BATCH_SIZE;
-        LeaveCriticalSection(&pfn_modified_list.lock);
-
-        EnterCriticalSection (&pfn_free_list.lock);
-        EnterCriticalSection (&pfn_standby_list.lock);
-        // Check if the combined number of free or standby pages list are running low
-        BOOL need_to_trim = (pfn_free_list.size + pfn_standby_list.size) < TRIM_LOW_BAR ;
-        LeaveCriticalSection (&pfn_free_list.lock);
-        LeaveCriticalSection(&pfn_standby_list.lock);
-
-        if (modified_sufficient) {
-            SetEvent(write_needed);
-        } else if (need_to_trim) {
-            trim_pages();
-            printf("TRIM THREAD: preemptive thread.\n");
-
-        }
-
-        if (need_to_trim && !modified_sufficient) {
-            trim_pages();
-            printf("TRIM THREAD: preemptive thread.\n");
-            // Call the write thread to move from modified to standby
-            if (pfn_modified_list.size >= WRITE_BATCH_SIZE) {
-                SetEvent(write_needed);
-            }
-        }
-
-        // In case there are no pages available in standby_list or free_list, get_free_page needs to trim pages
-        // It calls the trim_needed event, triggering the trim_thread to trim
-        if (WaitForSingleObject(trim_needed, 0) == WAIT_OBJECT_0) {
-            trim_pages();
-            printf("TRIM THREAD: emergency thread since no free/standby. Curr Stas:) free=%d, standby=%d, modified=%d\n ",
-                pfn_free_list.size, pfn_standby_list.size, pfn_modified_list.size);
-
-            // TODO: we are cooked her
-            // Check the status of free, standby, modified pages
-            EnterCriticalSection(&pfn_free_list.lock);
-            EnterCriticalSection(&pfn_modified_list.lock);
-
-            EnterCriticalSection(&pfn_standby_list.lock);
-            int free = pfn_free_list.size;
-            int modified = pfn_modified_list.size;
-            int standby = pfn_standby_list.size;
-            LeaveCriticalSection(&pfn_free_list.lock);
-            LeaveCriticalSection(&pfn_modified_list.lock);
-            LeaveCriticalSection(&pfn_standby_list.lock);
-
-            // If the write or another thread, freed some pages and sufficient; therefore, not requiring a write
-            if (free + standby > TRIM_LOW_BAR) {
-                printf("TRIM THREAD: emergency thread with no need to write. Curr Stas:) free=%d, standby=%d, modified=%d\n ",
-                    pfn_free_list.size, pfn_standby_list.size, pfn_modified_list.size);
-                SetEvent(pages_available);
-            }
-            // If there are not enough sufficient free or standby pages, must write to make standby pages
-            else if (modified > 0) {
-                printf("TRIM THREAD: emergency thread with write. Curr Stas:) free=%d, standby=%d, modified=%d\n ",
-                    pfn_free_list.size, pfn_standby_list.size, pfn_modified_list.size);
-                SetEvent(write_needed);
-            }
-            // Else, we exhausted every option
-            else {
-                // TODO: only problem, if stuck, that means the event that is waiting remains waiting
-                // What i realized is that it probably won't as i preemtively thread
-                // I call trim_needed again for the sake of the Wait,
-                printf("TRIM THREAD: Trim failed. Emergency thread failed\n");
-                printf("All pages currently active right now\n");
-
-                // Call trim_needed again to retry as all pages are currently active as the thread that called the event
-                // is still waiting for the pages_available call
-                SetEvent(trim_needed);
-            }
-
-        }
-    }
 }
 
 DWORD WINAPI
 write_thread (LPVOID lpParam) {
-    printf("ENTER WRITE THREAD");
     // Create an array of events that trigger the thread
     HANDLE events[2] = { write_needed, shutdown_event };
 
@@ -1130,15 +1110,10 @@ write_thread (LPVOID lpParam) {
         // 2. if the free page supply is nearly depleted and there are some modified pages to write
         int modified, supply;
 
-        EnterCriticalSection(&pfn_modified_list.lock);
+        // Access the counts of free, modified, and standby list without lock
+        // The choice of no locks were intentional as we only want a snapshot or rough estimate to guide our logic flow
         modified = pfn_modified_list.size;
-        LeaveCriticalSection(&pfn_modified_list.lock);
-
-        EnterCriticalSection(&pfn_free_list.lock);
-        EnterCriticalSection(&pfn_standby_list.lock);
         supply = pfn_free_list.size + pfn_standby_list.size;
-        LeaveCriticalSection(&pfn_standby_list.lock);
-        LeaveCriticalSection(&pfn_free_list.lock);
 
         BOOL full_batch = (modified >= WRITE_BATCH_SIZE);
         BOOL emergency = (supply < EMERGENCY_LOW_BAR && modified > 0);
@@ -1164,14 +1139,14 @@ write_thread (LPVOID lpParam) {
         }
 
         // Find how many avilable disc slots based on counter of filled pages
-        EnterCriticalSection (&disc_lock);
+        // No need for lock as the worker threads that have access to these variables would only increase the amount
+        // of empty slots; therefore, the number of available disc slots would increase which does not affect our code
         int available_disc_slots =  disc_page_count - filled_disc_slots;
-        LeaveCriticalSection (&disc_lock);
 
         // If there are no empty slots
         if (available_disc_slots <= 0) {
             // Disk is full so pages cannot go from modified to disk
-            printf("WRITE THREAD: Disk is full\n");
+            // printf("WRITE THREAD: Disk is full\n");
 
             EnterCriticalSection (&pfn_free_list.lock);
             EnterCriticalSection (&pfn_standby_list.lock);
@@ -1272,7 +1247,9 @@ write_thread (LPVOID lpParam) {
 
 BOOL
 initialize_system() {
-        // Return value from AllocateUserPhysicalPages
+    printf("Setting up system \n");
+
+    // Return value from AllocateUserPhysicalPages
     BOOL allocated;
     // Return value from GetPrivilege()
     BOOL privilege;
@@ -1286,7 +1263,7 @@ initialize_system() {
     initialize_list_head(&pfn_standby_list);
 
     // Initialize the multithreading locks
-    InitializeCriticalSection(&disc_lock);
+    InitializeCriticalSectionAndSpinCount(&disc_lock, 0x00FFFFFF);
 
     // MULTITHREADING TESTER
     // manual-reset=NULL, starts unsignaled=FALSE
@@ -1468,7 +1445,7 @@ initialize_system() {
 
     // Iterate through each pte_section and initialize its respective lock
     for (int i = 0; i < NUM_PTE_SECTIONS; i++) {
-        InitializeCriticalSection(&pte_sections[i].lock);
+        InitializeCriticalSectionAndSpinCount(&pte_sections[i].lock, 0x00FFFFFF);
 
         // Iterate through each pte_section's age lists to initilize list_heads and counters
         for (int j = 0; j < NUM_AGES; j++) {
@@ -1511,8 +1488,6 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
 
     // If the disc is currently being written to disc
     if (meta->write_in_progress == 1) {
-        printf("Soft faulted while page is being written to disk.\n");
-
         // Can update the write_in_progress bit about the soft fault so the disc can later empty the stale slot
         meta->write_in_progress = 0;
     }
@@ -1747,11 +1722,19 @@ full_virtual_memory_test (
     int curr_thread = (int)(intptr_t)thread_id;
     // Store it into the global variable
     my_thread_id = curr_thread;
-#if DEBUG
-    while (1) {
-#else
-    for (i = 0; i < 1000000 ; i += 1) {
-#endif
+
+    printf("Thread %d entered full virtual memory_test \n", curr_thread);
+
+    // Initialize a local thread for random function
+    THREAD_RNG_STATE my_rng;
+    InitializeThreadRNG(&my_rng);
+
+    // Start the individual threads timer
+    LARGE_INTEGER frequency, start, end;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    for (i = 0; i < MB(1) ; i += 1) {
         //
         // Randomly access different portions of the virtual address
         // space we obtained above.
@@ -1769,9 +1752,9 @@ full_virtual_memory_test (
 
         // If the arbitrary VA is empty or successfully stamped, generate the next arbitrary VA
         if (fault_resolution == TRUE) {
-            // Gives a truly  random number
-            random_number = rand () * rand () * rand ();
+            // Get a random number
 
+            random_number = GetNextRandom(&my_rng);
             random_number %= virtual_address_size_in_unsigned_chunks;
 
             //
@@ -1835,7 +1818,7 @@ full_virtual_memory_test (
             }
 
             if (fault_resolution == FALSE) {
-                printf("The page fault resolution failed. Try again.\n");
+                //printf("The page fault resolution failed. Try again.\n");
                 // If the page did not get resolved, we will page fault again to try to resolve
                 LeaveCriticalSection(&section->lock);
                 // Try again, meaning i never increments
@@ -1846,8 +1829,15 @@ full_virtual_memory_test (
             // Update pte and pte section metadata
             set_pte_valid(section, meta, pte, pfn);
             LeaveCriticalSection(&section->lock);
+
+            // DOn't advance to the next VA, retry to make sure successful stamping of data
+            fault_resolution = FALSE;
+            if (i % 100000 == 0) printf(".");
         }
     }
+
+    // Stop the individual thread timer
+    QueryPerformanceCounter(&end);
 
     // Save the thread's totals into global array
     final_results[curr_thread].thread_id = curr_thread;
@@ -1855,6 +1845,7 @@ full_virtual_memory_test (
     final_results[curr_thread].soft_faults = my_soft_faults;
     final_results[curr_thread].repurpose_faults = my_repurpose_faults;
     final_results[curr_thread].total_accesses = successful_accesses;
+    final_results[curr_thread].elapsed_ms =  (double)(end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart;
 
     return 0;
 }
@@ -1896,6 +1887,11 @@ main (
         return 0;
     }
 
+    // Start timer for the total run time
+    LARGE_INTEGER total_frequency, total_start, total_end;
+    QueryPerformanceFrequency(&total_frequency);
+    QueryPerformanceCounter(&total_start);
+
     // Set up the events
     trim_needed = CreateEvent(NULL, FALSE, FALSE, NULL);
     write_needed = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -1905,6 +1901,8 @@ main (
     HANDLE trim_thread_handle  = CreateThread(NULL, 0, trim_thread, NULL, 0, NULL);
 
     HANDLE write_thread_handle = CreateThread(NULL, 0, write_thread, NULL, 0, NULL);
+
+    HANDLE age_thread_handle = CreateThread(NULL, 0, age_thread, NULL, 0, NULL);
 
     HANDLE thread_handles[NUM_THREADS];
     DWORD thread_ids[NUM_THREADS];
@@ -1934,12 +1932,17 @@ main (
         printf("WaitForMultipleObjects succeeded\n");
     }
 
+    // Stop the timer for the total workload
+    QueryPerformanceCounter(&total_end);
+    double total_ms = (double)(total_end.QuadPart - total_start.QuadPart) * 1000.0 / total_frequency.QuadPart;
+
     // Tell all background threads to stop
     SetEvent(shutdown_event);
 
     // Wait for the background threads to exit
     WaitForSingleObject(write_thread_handle, INFINITE);
     WaitForSingleObject(trim_thread_handle, INFINITE);
+    WaitForSingleObject(age_thread_handle, INFINITE);
 
     check_accuracy();
 
@@ -1951,6 +1954,7 @@ main (
     // Close background thread handles
     CloseHandle(trim_thread_handle);
     CloseHandle(write_thread_handle);
+    CloseHandle(age_thread_handle);
 
     // Close events
     CloseHandle(trim_needed);
@@ -1960,14 +1964,21 @@ main (
 
     // Print Stats
     printf("\nRESULTS\n");
+    long long all_accesses = 0;
+
     for (int i = 0; i < NUM_THREADS; i++) {
         printf("Thread %d:\n", i);
         printf ("full_virtual_memory_test : finished accessing %u random virtual addresses\n", final_results[i].total_accesses);
         printf("Hard Faults: %d\n", final_results[i].hard_faults);
         printf("Soft-Faults: %d\n", final_results[i].soft_faults);
         printf("Repurpose Faults: %d\n", final_results[i].repurpose_faults);
+        printf("Time: %.2f ms\n", final_results[i].elapsed_ms);
+        all_accesses += final_results[i].total_accesses;
         printf("\n");
     }
+
+    printf("Total time for all workload: %.2f ms\n", total_ms);
+    printf("Total accesses across threads: %lld\n", all_accesses);
 
     cleanup();
     return 0;
