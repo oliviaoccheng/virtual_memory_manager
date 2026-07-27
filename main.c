@@ -124,6 +124,8 @@
 #define TRIM_LOW_BAR 500
 #define EMERGENCY_LOW_BAR 120
 #define TRIM_BATCH_SIZE 500 // How many pages to trim per batch
+// TODO: later make this number dynamic based on pressure instead of constat
+#define MINIMUM_TRIM_SIZE (TRIM_BATCH_SIZE / 4)
 // Number of modified pages we want before writing to disk
 // Number can't exceed the disk size
 # define WRITE_BATCH_SIZE 500
@@ -145,10 +147,11 @@
 
 // NEW CONSTANTS: REORGANIZE
 // How many sections we age per call
-#define AGE_SECTIONS_PER_TIME 8
+#define AGE_MIN_SECTIONS 4 // Minimum section
+#define AGE_MAX_SECTIONS 20 // Max sections to age at a time
 
 // Global to keep track of the dynamic batch size of the ager
-volatile LONG age_batch_sections = 1;
+volatile LONG age_batch_sections = 10;
 
 // Track the duration and volume of trim calls
 volatile LONG64 trim_total_qpc = 0;
@@ -197,7 +200,8 @@ typedef struct {
     ULONG_PTR valid: 1;
     ULONG_PTR frame_number: 40;
     ULONG_PTR age: 3;
-    ULONG_PTR reserved: 20;
+    ULONG_PTR access: 1;
+    ULONG_PTR reserved: 19;
 } VALID_PTE, *PVALID_PTE;
 
 typedef struct {
@@ -245,7 +249,7 @@ typedef struct {
 typedef struct {
     CRITICAL_SECTION lock;
     LIST_ENTRY age_lists[NUM_AGES];
-    int age_counts[NUM_AGES];
+    ULONG_PTR age_counts[NUM_AGES];
 } PTE_SECTION;
 
 typedef struct _DISC_SLOT_ENTRY {
@@ -291,8 +295,8 @@ HANDLE pages_available;
 CRITICAL_SECTION disc_lock;
 
 // Check if the threads are active
-boolean write_thread_active = FALSE;
-boolean trim_thread_active = FALSE;
+volatile LONG write_thread_active = 0;
+volatile LONG trim_thread_active = 0;
 
 // Virtual Address space
 // Pointer to the start of the space allocated for the user virtual address
@@ -499,11 +503,18 @@ PTE_SECTION *
 // Need to be called with a lock
 VOID
 set_pte_valid(PTE_SECTION * section, pfn_metadata * meta, PPTE pte, ULONG_PTR pfn) {
-    // Set new frame number
-    pte->hardware.frame_number = pfn;
-    // Reset hardware age
-    pte->hardware.age = 0;
-    pte->hardware.valid = TRUE;
+    // Build the new valid PTE, the valid PTE state for the InterlockedExchange
+    PTE new;
+    new.entire = 0;
+    new.hardware.frame_number = pfn;
+    new.hardware.age = 0;
+    new.hardware.access = 0;
+    new.hardware.valid = TRUE;
+
+    // TODO: make sure compare was not the wrong choice, since i really don't know how to do compare
+    // Currently, no one has access to this page. Its on the section lock and is not on a list so no thread has access concurrently.
+    // No need for a compare especially because the old value could either be zero (hard fault) or transition (soft fault/disc)
+    InterlockedExchange64((volatile LONG64 *) &pte->entire, (LONG64) new.entire);
 
     // Add pte into the smallest, hottest age list (i.e. 0) in its corresponding section
     InsertTailList(&section->age_lists[0], &meta->list);
@@ -511,18 +522,70 @@ set_pte_valid(PTE_SECTION * section, pfn_metadata * meta, PPTE pte, ULONG_PTR pf
     section->age_counts[0]++;
 }
 
-// Set valid bit to 0, but leave the physical page linked in case we want to retrieve the data
+// Set the access bit during the worker thread to streamline the process without having to wait for pte section lock
 VOID
-set_pte_invalid(PPTE pte) {
-    pte->hardware.valid = FALSE;
+set_access_bit(PPTE pte) {
+    // Look at the current state of the pte
+    PTE old;
+    old.entire = pte->entire;
+
+    // Confirm that it is a valid PTE. If not, it is likely a trimmer changed it's state; therefore, no need for access bit
+    if (old.hardware.valid == 0) {
+        return;
+    }
+
+    // If the access bit is already set, exit too
+    if (old.hardware.access == 1) {
+        return;
+    }
+
+    // Set the new PTE for the InterlockedCompareExchange
+    PTE new;
+    new.entire = old.entire;
+    new.hardware.access = 1;
+
+    // Update the PTE to its new value with access bit equal to 1 as long as it remains in its old state
+    // Only try once because if it fails either the bit is already set or the page is no longer valid
+    ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64((volatile LONG64 *) &pte->entire, (LONG64) new.entire, (LONG64) old.entire);
+
+    // Successfully updated its access bit
+    if (actual_value == old.entire) {
+        return;
+    }
+    // TODO: does it have to be while true? like what if it failes
 }
 
-// Increment age unless age equals the maximum of 7; therefore, it remains the same
-VOID
-increment_pte_age(PVALID_PTE pte) {
-    if (pte->age < 7) {
-        pte->age++;
+// Retursn whether or now the access bit was reset
+// If return True, it should be aged
+BOOLEAN
+clear_access_bit(PPTE pte) {
+    // Read the PTE's current state
+    PTE old;
+    old.entire = pte->entire;
+
+    // If the PTE is invalid, there is no need for aging nor access bit
+    if (old.hardware.valid == 0) {
+        return FALSE;
     }
+
+    // If the access bit was already invalid, no need to clear
+    if (old.hardware.access == 0) {
+        return FALSE;
+    }
+
+    // Set the new PTE all at once for Interlocked Compare Exchange
+    PTE new;
+    new.entire = old.entire;
+    new.hardware.access = 0;
+
+    // Only try once because if we fail the page was just accessed
+    ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64((volatile LONG64 *) &pte->entire, (LONG64) new.entire, (LONG64) old.entire);
+
+    // TODO: change this name lowk
+    if (actual_value == old.entire) {
+        return TRUE;
+    }
+    return FALSE;
 }
 
 // PFN TABLE HELPERS
@@ -839,16 +902,14 @@ VOID
 request_pages() {
     // If I have pages worth writing: modified met full batch or emergency with some modified pages
     if (need_to_write()) {
-        if (!write_thread_active) {
-            write_thread_active = TRUE;
+        if (InterlockedCompareExchange(&write_thread_active, 1, 0) == 0) {
             SetEvent(write_needed);
         }
         return;
     }
 
     // If there are not enough modified pages to write, must trim
-    if (!trim_thread_active) {
-        trim_thread_active = TRUE;
+    if (InterlockedCompareExchange(&trim_thread_active, 1, 0) == 0) {
         SetEvent(trim_needed);
     }
 
@@ -905,21 +966,32 @@ get_free_page() {
 
             // Get the address of the pte related to the data in the standby page
             PPTE old_pte = meta->pte;
-            // Copy the contents of the pte
-            PTE new_pte_contents = * old_pte;
 
-            // Update the contents of the copied pte
-            // Mark as invalid, not transition, in disc, and change PFN to disk address
-            new_pte_contents.disc.valid = 0;
-            new_pte_contents.disc.transition = 0;
-            new_pte_contents.disc.disc = 1;
-            new_pte_contents.disc.disc_index = meta->disc_index;
+            // Change the PTE from transition to disk format
+            while (TRUE) {
+                PTE old;
+                old.entire = old_pte->entire;
 
-            // Update the contents of the pte
-            old_pte->entire = new_pte_contents.entire;
+                // Make the new PTE state
+                // Mark as invalid, not transition, in disc, and change PFN to disk address
+                PTE new;
+                new.entire = old.entire;
+                new.disc.valid = 0;
+                new.disc.transition = 0;
+                new.disc.disc = 1;
+                new.disc.disc_index = meta->disc_index;
+
+                ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64(
+                    (volatile LONG64 *) &old_pte->entire,
+                    (LONG64) new.entire, (LONG64) old.entire);
+
+                // Check if it successed
+                if (actual_value == old.entire) {
+                    break;
+                }
+            }
 
             my_repurpose_faults++;
-
             // Set the page metadata to isOccupied
             meta->isOccupied = 1;
 
@@ -969,18 +1041,74 @@ age_pages() {
 
         // Age from oldest to youngest skipping any pages that already reached the maximum age
         for (int age = NUM_AGES - 2; age >= 0; age--) {
+            // TODO: add a limit to the number of pages
             // Iterate through each page in the age bucket and age each PTE by one
             while (section->age_counts[age] > 0) {
                 // Remove and store the pointer to the head of the current age linked list
                 pfn_metadata * pfn = (pfn_metadata *) RemoveHeadList(&section->age_lists[age]);
                 section->age_counts[age]--;
 
-                // Update the PTE age field by one
-                pfn->pte->hardware.age = age + 1;
+                // Get the pointer to the PTE to update its access bit if needed
+                PPTE pte = pfn->pte;
 
-                // Put it into the next age bucket (age + 1)
-                InsertTailList(&section->age_lists[age + 1], &pfn->list);
-                section->age_counts[age + 1]++;
+                // Figure out which new list to put the page onto
+                int new_age = -1;
+
+                PTE old;
+                old.entire = pte->entire;
+
+                // Need to make sure the aging thread succeeds in updating its age
+                // Therefore, its in a forever loop because it must fight the lock contention
+                while (TRUE) {
+
+                    // TODO: if never hit, remove
+                    // Check if the trimmer already got to it to prevent unnecessary calls
+                    // And to get out of this forever loop
+                    if (old.hardware.valid == 0) {
+                        // Make an impossible age as it doesn't belong in one
+                        new_age = -1;
+                        DebugBreak();
+                        break;
+                    }
+
+                    PTE new;
+                    new.entire = old.entire;
+
+                    // Based on the access bit, find its respecitive age bucket
+                    // Its ok to read the PTE without a lock because the compare and exchange will catch any false claims
+                    // Also, its the entire thing so nothing is halfwritten
+                    if (old.hardware.access == 1) {
+                        new.hardware.access = 0;
+                        new.hardware.age = 0;
+                        new_age = 0;
+                    } else if (old.hardware.age < 7) {
+                        // If it wasn't recently accessed, age like normal
+                        new.hardware.age = age + 1;
+                        new_age = age + 1;
+                    } else {
+                        new_age = 7;
+                        // If the age bucket is 7, no need to udpate anything, break
+                        break;
+                    }
+
+                    // If another thread changes the value of PTE, the edit will fail; therefore, we will read the updated value
+                    // And make appropriate adjustments
+                    ULONG_PTR actual_value =  (ULONG_PTR) InterlockedCompareExchange64((volatile LONG64 *) &pte->entire, (LONG64) new.entire, (LONG64) old.entire);
+
+                    // If we successfully changed its value, leave
+                    if (actual_value == old.entire) {
+                        break;
+                    }
+
+                    old.entire = actual_value;
+
+                }
+
+                if (new_age >= 0) {
+                    // Put it into the next age bucket (age + 1)
+                    InsertTailList(&section->age_lists[new_age], &pfn->list);
+                    section->age_counts[new_age]++;
+                }
             }
         }
 
@@ -1008,9 +1136,11 @@ consumption_rate() {
         // Add up all the values of pages consumed
         total += history[i];
     }
-
     // Average pages consumed per tick during this window of time
     ULONG_PTR avg_per_tick = total / HISTORY_LENGTH;
+
+    // Find batch size for aging but use the constant as a baseline
+    int age_batch_size = AGE_MIN_SECTIONS;
 
     // CONSUMPTION_TICK is 3ms, so pages/sec = avg_per_tick * (1000/3)
     DEBUG_PRINT("[CONSUME] %llu pages/tick (~%llu pages/sec) | free=%llu standby=%llu modified=%llu\n",
@@ -1024,26 +1154,30 @@ consumption_rate() {
         // At this rate, how many ticks until we run out of available pages without trimming/writing to disk
         ULONG_PTR remaining_ticks = (pfn_free_list.size + pfn_standby_list.size) / avg_per_tick;
 
+        // Caclulate the dynamic batch size for the aging thread
+        // For emergencies, do max aging sections
+        if (remaining_ticks == 0) {
+            age_batch_size = AGE_MAX_SECTIONS;
+        } else {
+            // Inverse relationships: greater the remaining_ticks, smaller the batch
+            age_batch_size = (int)((NUM_PTE_SECTIONS * MIN_TICK_THRESHOLD) / remaining_ticks);
+        }
+
+        // If the age batch size is smaller the minimum baseline reset it
+        if (age_batch_size < AGE_MIN_SECTIONS) {
+            age_batch_size = AGE_MIN_SECTIONS;
+        }
+        if (age_batch_size > AGE_MAX_SECTIONS) {
+            age_batch_size = AGE_MAX_SECTIONS;
+        }
+
         if (remaining_ticks < MIN_TICK_THRESHOLD) {
             request_pages();
-
-            // Based on the value of remaining_ticks, calculate the urgency
-            // The value of urgency will then dynamically size the batch size of the ager
-
-            // Given that remaining_ticks < MIN_TICK_THRESHOLD
-            // The smaller the value of remaining_ticks, the greater the urgency; hence, the greater batch size
-            ULONG_PTR urgency = MIN_TICK_THRESHOLD - remaining_ticks;
-            // Generates values 1 through NUM_PTE_SECTIONS
-            int batch_size = 1 + (int) ((urgency * NUM_PTE_SECTIONS) / MIN_TICK_THRESHOLD);
-            // In cas of integer rounding, set a max
-            if (batch_size > NUM_PTE_SECTIONS) {
-                batch_size = NUM_PTE_SECTIONS;
-            }
-
-            // Use Interlocked operations to ensure that the value is protected when age_pages is reading it
-            InterlockedExchange(&age_batch_sections, batch_size);
-            SetEvent(age_needed);
         }
+
+        // Use Interlocked operations to ensure that the value is protected when age_pages is reading it
+        InterlockedExchange(&age_batch_sections, age_batch_size);
+        SetEvent(age_needed);
     }
 
 }
@@ -1052,6 +1186,9 @@ consumption_rate() {
 // Calling function needs to hold the pte_lock
 BOOL
 handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta, ULONG_PTR * official_pfn) {
+    // Caller holds section lock
+    PTE_SECTION *section = get_section(pte);
+
     // Get the pfn from the pte
     ULONG_PTR pfn = pte->transition.frame_number;
 
@@ -1079,25 +1216,33 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
         return FALSE;
     }
 
-    // If the disc is currently being written to disc
+    BOOL reclaim_disc_slot = FALSE;
+
+    // If the disc is currently being written to disc, don't touch its list nodes but signal that the page soft faulted
+    // Therefore, allowing the disc to release the slot
     if (meta->write_in_progress == 1) {
         // Can update the write_in_progress bit about the soft fault so the disc can later empty the stale slot
         meta->write_in_progress = 0;
-    }
-
-    // Check if page is in standby used to trigger empty disc slot after releasing the lock
-    BOOL was_standby = (meta->isOccupied == 3);
-
-    // Remove the page from the standby/modified list
-    RemoveEntryList (&meta->list);
-
-    // Update the counter
-    if (was_standby) {
-        pfn_standby_list.size--;
     } else {
-        // There was a soft fault from the modified list count
-        pfn_modified_list.size--;
+        // Check if page is in standby used to trigger empty disc slot after releasing the lock
+        BOOL was_standby = (meta->isOccupied == 3);
+
+        // Remove the page from the standby/modified list
+        RemoveEntryList (&meta->list);
+
+        // Update the counter
+        if (was_standby) {
+            pfn_standby_list.size--;
+            reclaim_disc_slot = TRUE;
+        } else {
+            // There was a soft fault from the modified list count
+            pfn_modified_list.size--;
+        }
     }
+
+    // TODO: is this needed?
+    meta->isOccupied = 1;
+
     // Release the lock
     LeaveCriticalSection (&pfn_modified_list.lock);
     LeaveCriticalSection (&pfn_standby_list.lock);
@@ -1114,7 +1259,7 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
 
     // printf("[Thread %d] SOFT FAULT mapped VA %p to PFN %llx\n", my_thread_id, (void*)aligned_va, (unsigned long long)pfn);
 
-    if (was_standby) {
+    if (reclaim_disc_slot) {
         // Clean our disc metadata
         empty_disc_slot(meta->disc_index);
     }
@@ -1131,6 +1276,7 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
 // Calling function needs to hold the pte_lock
 BOOL
 handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta, ULONG_PTR * official_pfn) {
+    // Caller holds section lock
     PTE_SECTION *section = get_section(pte);
 
     // This a zero PTE or a disc PTE
@@ -1279,13 +1425,11 @@ trim_thread (LPVOID lpParam) {
             break;
         }
 
-        trim_thread_active = FALSE;
-
+        InterlockedExchange(&trim_thread_active, 0);
         trim_pages();
 
         // Check if you need to wake the writer: if the batch size was met or if it is an emergency
-        if (need_to_write() && !write_thread_active) {
-            write_thread_active = TRUE;
+        if (need_to_write() && (InterlockedCompareExchange(&write_thread_active, 1, 0) == 0)) {
             SetEvent(write_needed);
         }
     }
@@ -1307,7 +1451,7 @@ write_thread (LPVOID lpParam) {
             break;
         }
 
-        write_thread_active = FALSE;
+        InterlockedExchange(&write_thread_active, 0);
 
         // Double check if a write is actually warranted as states might have changed
         if (!need_to_write()) {
@@ -1333,7 +1477,7 @@ write_thread (LPVOID lpParam) {
                 SetEvent(pages_available);
                 // Update the trim thread activity after pages are avaialble to prevent other thread's repeadtely calling
                 // the trimmer thread unnecessarily
-                trim_thread_active = FALSE;
+                InterlockedExchange(&trim_thread_active, 0);
             }
 
             continue;
@@ -1353,16 +1497,22 @@ write_thread (LPVOID lpParam) {
         while (num_pages_written < available_disc_slots &&
             num_pages_written < WRITE_BATCH_SIZE &&
             current != &pfn_modified_list.entry) {
+            PLIST_ENTRY next = current->Flink;
 
             pfn_metadata * meta = (pfn_metadata *) current;
             // Mark as writing to disk
             meta->write_in_progress = 1;
 
+            // Move the page off the modified list so any other list cannot access it
+            RemoveEntryList(&meta->list);
+            pfn_modified_list.size--;
+            meta->write_in_progress = 1;
+
             // Add to the array of pages to write to disk and increment counter
             pages_to_write[num_pages_written++] = meta;
 
-            // Set next page
-            current = current->Flink;
+            // Move onto the next one
+            current = next;
         }
 
         LeaveCriticalSection (&pfn_modified_list.lock);
@@ -1403,9 +1553,6 @@ write_thread (LPVOID lpParam) {
             // Or the page was successfully written in disk and now trasitioning to disk state
             // Write data to disk
             meta->disc_index = slot;
-
-            RemoveEntryList (&meta->list);
-            pfn_modified_list.size--;
 
             meta->write_in_progress = 0;
             // In disk state
@@ -1549,6 +1696,121 @@ CreateSharedMemorySection (
 }
 
 #endif
+
+ULONG_PTR
+trim_a_section(PTE_SECTION *section, int section_batch_size, int include_access_bit, int wait_for_lock) {
+    // Check if no need to trim any more pages
+    if (section_batch_size <= 0) {
+        return 0;
+    }
+
+    if (wait_for_lock) {
+        // Wait for the section lock
+        EnterCriticalSection(&section->lock);
+    } else {
+        // Failed to accquire section lock, move onto next section
+        if (TryEnterCriticalSection(&section->lock) == FALSE) {
+            return 0;
+        }
+    }
+
+    // Initialize array to keep track of pages to trim
+    pfn_metadata * trimmed_pages[TRIM_BATCH_SIZE];
+    PVOID trimmed_pages_vas[TRIM_BATCH_SIZE];
+    // Keep track of how many pages trimmed in this section
+    int sec_pages_trimmed = 0;
+
+    for (int age = NUM_AGES - 1; age >= 0 && sec_pages_trimmed < section_batch_size; age--) {
+        // Go through each list from the end to skipp any pages with a valid access bit
+        // Therefore, the recently accessed pages will remain on the list until the ager moves it accorindlgy
+        PLIST_ENTRY current = section->age_lists[age].Flink;
+
+        // TODO: wth is hapepnign with my ageListCounts
+        // Continue while there are pages on the age list or while number of pages trimmed is less than batch size
+        while (current != &section->age_lists[age] && sec_pages_trimmed < section_batch_size) {
+            // Grab the next pointer
+            PLIST_ENTRY next = current->Flink;
+
+            // Get the pfn metadata of the current page we might trim to get PTE
+            pfn_metadata * trim_page = (pfn_metadata *) current;
+            PPTE pte = trim_page->pte;
+
+            // FInd the state of the PTE
+            PTE old;
+            old.entire = pte->entire;
+
+            // If its valid and access bit is 1, skip it and leave it linked; therefore, advance to the next page
+            // If its pass 2, we need pages; therefore, we will include hot pages into the triming candidates
+            if (!include_access_bit && old.hardware.valid == 1 && old.hardware.access == 1) {
+                // Move onto the next page (the current page's FLINK) as we are going from back to forward
+                current = next;
+                continue;
+            }
+
+            // Modify the PTE from valid to transition
+            // Build the transition state PTE
+            PTE new;
+            new.entire = 0;
+            new.transition.valid = 0;
+            new.transition.transition = 1;
+            new.transition.frame_number = find_frame_number_from_pfn(trim_page);
+
+            // Only update it if its state reamins valid with access bit invalid to ensure a worker thread didn't change it
+            ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64(
+                (volatile LONG64 *) &pte->entire,
+                (LONG64) new.entire, (LONG64) old.entire);
+
+            // A worker thread changed its state meaning no longer viable to trim
+            if (actual_value != old.entire) {
+                // If it failed, the worker thread likely touched it mid trim so just move on
+                current = next;
+                continue;
+            }
+
+            // TODO: based on how many we trimmed in our big loop, that means we failed; then try again without the access bit restriction
+            // uses a local to figure out ANY _PAGES
+
+            // Sucessfuly mapped the page to transition state
+            // Remove from its age list
+
+            RemoveEntryList(&trim_page->list);
+            section->age_counts[age]--;
+
+            trimmed_pages_vas[sec_pages_trimmed] = get_va_from_pte(pte);
+            trimmed_pages[sec_pages_trimmed] = trim_page;
+
+            sec_pages_trimmed++;
+
+            // Move onto next page
+            current = next;
+        }
+    }
+
+    if (sec_pages_trimmed > 0) {
+        // While holding the section's lock, unmap the batch before another thread accesses it
+        if (MapUserPhysicalPagesScatter(trimmed_pages_vas, sec_pages_trimmed, NULL) == FALSE) {
+            printf("TRIM_PAGES: scatter unmapped failed\n");
+        }
+
+        // Update the trimmed_pages to the modified status
+        EnterCriticalSection(&pfn_modified_list.lock);
+        for (int i = 0; i < sec_pages_trimmed; i++) {
+            // Check if the page is already on the modified list
+            // As it will cause the page to be on the modified list twice, messing up the writer
+            if (trimmed_pages[i]->isOccupied == 2) {
+                continue;
+            }
+            trimmed_pages[i]->isOccupied = 2;
+            // Add onto modified list
+            InsertTailList(&pfn_modified_list.entry, &trimmed_pages[i]->list);
+            pfn_modified_list.size++;
+        }
+        LeaveCriticalSection(&pfn_modified_list.lock);
+    }
+
+    LeaveCriticalSection(&section->lock);
+    return sec_pages_trimmed;
+}
 // Create a event
 VOID
 trim_pages() {
@@ -1567,75 +1829,21 @@ trim_pages() {
     }
 
     int total_pages_trimmed = 0;
-    int curr_section = 0;
 
-    // Iterate through each section, holding its own lock at a time
-    while (curr_section < NUM_PTE_SECTIONS && total_pages_trimmed < TRIM_BATCH_SIZE) {
-        // Find pointer to curr_section
-        PTE_SECTION * section = &pte_sections[curr_section];
-        // Initialize array to keep track of pages to trim
-        pfn_metadata * trimmed_pages[TRIM_BATCH_SIZE];
-        PVOID trimmed_pages_vas[TRIM_BATCH_SIZE];
-        // Keep track of how many pages trimmed in this section
-        int sec_pages_trimmed = 0;
-
-        EnterCriticalSection(&section->lock);
-
-        // Iterate through the age lists by oldest/coldest page to youngest/hottest page
-        int age = NUM_AGES - 1;
-        // Continue iterating while the number of pages trimmed is less than the batch size
-        while (age >= 0 && total_pages_trimmed + sec_pages_trimmed < TRIM_BATCH_SIZE) {
-            // Iterate through the current oldest age bucket and pop off as many pages as needed
-            while (section->age_counts[age] > 0 && total_pages_trimmed + sec_pages_trimmed < TRIM_BATCH_SIZE) {
-                // Pop the head of the current age list and store the pointer to its pfn_metadata
-                pfn_metadata * trim_page = (pfn_metadata *) RemoveHeadList(&section->age_lists[age]);
-
-                // Update the counter on the number of items of the linked list
-                section->age_counts[age]--;
-
-                // Get the pte of the trimmed page and store it in the array of trimmed page's VA
-                PPTE pte = trim_page->pte;
-                trimmed_pages_vas[sec_pages_trimmed] = get_va_from_pte(pte);
-
-                // Invalidate the pte
-                set_pte_invalid(pte);
-                // Update the pte to transition state
-                pte->transition.transition = 1;
-                pte->transition.frame_number = find_frame_number_from_pfn(trim_page);
-
-                trimmed_pages[sec_pages_trimmed] = trim_page;
-
-                sec_pages_trimmed++;
-            }
-
-            // Move on to the next largest age
-            age--;
-        }
-
-        if (sec_pages_trimmed > 0) {
-            // While holding the section's lock, unmap the batch before another thread accesses it
-            if (MapUserPhysicalPagesScatter(trimmed_pages_vas, sec_pages_trimmed, NULL) == FALSE) {
-                printf("TRIM_PAGES: scatter unmapped failed\n");
-            }
-
-            // Update the trimmed_pages to the modified status
-            EnterCriticalSection(&pfn_modified_list.lock);
-            for (int i = 0; i < sec_pages_trimmed; i++) {
-                trimmed_pages[i]->isOccupied = 2;
-                // Add onto modified list
-                InsertTailList(&pfn_modified_list.entry, &trimmed_pages[i]->list);
-                pfn_modified_list.size++;
-            }
-            LeaveCriticalSection(&pfn_modified_list.lock);
-
-            total_pages_trimmed += sec_pages_trimmed;
-        }
-
-        LeaveCriticalSection(&section->lock);
-
-        curr_section++;
+    // Pass 1: optimized to skip any pages with an access bit or any section that it can't get it's section lock on the first try
+    // Essentially skip busy PTE sections and hot pages
+    for (int i = 0; i < NUM_PTE_SECTIONS && total_pages_trimmed < TRIM_BATCH_SIZE; i++) {
+        int section_batch_size = TRIM_BATCH_SIZE - total_pages_trimmed;
+        total_pages_trimmed += trim_a_section(&pte_sections[i], section_batch_size, FALSE, FALSE);
     }
 
+    // Pass 2: if Pass 1 failed to trim enough. wait for every section lock and ignore the access bit
+    if (total_pages_trimmed < MINIMUM_TRIM_SIZE) {
+        for (int i = 0; i < NUM_PTE_SECTIONS && total_pages_trimmed < TRIM_BATCH_SIZE; i++) {
+            int section_batch_size = TRIM_BATCH_SIZE - total_pages_trimmed;
+            total_pages_trimmed += trim_a_section(&pte_sections[i], section_batch_size, TRUE, TRUE);
+        }
+    }
     QueryPerformanceCounter(&t1);
     // Allows the counters to be updated without fear of overlapping threads
     InterlockedAdd64(&trim_total_qpc, t1.QuadPart - t0.QuadPart);
@@ -2078,13 +2286,15 @@ full_virtual_memory_test (
             fault_resolution = FALSE;
             if (i % 100000 == 0) printf(".");
         } else {
-            // Advance when successful access
             locality_advance(&loc);
 
             // Reset pte age bit an
             PPTE pte = get_pte_from_va(arbitrary_va);
-            // Change their list
-            PTE_SECTION * section = get_section(pte);
+
+            // Successfuly accessed an already mapped page; update the access bit
+            // No need to move it into a different age bucket during the worker thread as it is costly
+            // Instead, during an aging thread's run, it will use the access to change to list 0.
+            set_access_bit(pte);
 
             // TODO: check if the age is not 0 before acquring the lock
             // TODO: update the pte and not the buckets, and update buckets in the ager
@@ -2092,24 +2302,6 @@ full_virtual_memory_test (
             // TODO: add a access bit in hardware, to help me get rid of the age bits in the pte
             // TODO: can reset in the really hot function really fast, and only update in the ager.
             // TODO: cfor the trimmer, just check if its acceess bit is 0 when trimming
-            EnterCriticalSection(&section->lock);
-
-            // Check if the state is still valid as the trimmer could have changed its state
-            if (pte->hardware.valid == 1 && pte->hardware.age != 0) {
-                // Find its current age to then remove from the lsit
-                ULONG_PTR old_age = pte->hardware.age;
-                pfn_metadata * meta = find_pfn_from_frame_number(pte->hardware.frame_number);
-
-                // Remove the pfn from its current age bucket and reset counter
-                RemoveEntryList(&meta->list);
-                section->age_counts[old_age]--;
-
-                // Reset to being a hot page
-                pte->hardware.age = 0;
-                InsertTailList(&section->age_lists[0], &meta->list);
-                section->age_counts[0]++;
-            }
-            LeaveCriticalSection(&section->lock);
         }
     }
     // TODO: fix the linear function such that it goes back to old linear stuff
