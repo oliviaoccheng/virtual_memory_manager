@@ -130,7 +130,6 @@
 // Number can't exceed the disk size
 # define WRITE_BATCH_SIZE 500
 
-// TODO: base the age based on consumption rate and how many pages available
 // Background Thread
 #define AGE_TICK_MS 250 // How often the age function preemptively checks
 #define CONSUMPTION_TICK 3 // How often the consumption thread preemptively checks
@@ -546,13 +545,16 @@ set_access_bit(PPTE pte) {
 
     // Update the PTE to its new value with access bit equal to 1 as long as it remains in its old state
     // Only try once because if it fails either the bit is already set or the page is no longer valid
+    // Regardless if the set_access_bit succeds on setting the access bit, it will be ok; therefore, no need to put in a while(TRUE)
+    // Only the aging and trimming thread can access
+    // If the aging thread changed the state beforehand, the access bit is erased and access bit fails.
+    // Trimming thread reads in the data, and marks it as invalid; therefore, the access bit fails
     ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64((volatile LONG64 *) &pte->entire, (LONG64) new.entire, (LONG64) old.entire);
 
     // Successfully updated its access bit
     if (actual_value == old.entire) {
         return;
     }
-    // TODO: does it have to be while true? like what if it failes
 }
 
 // Retursn whether or now the access bit was reset
@@ -578,14 +580,12 @@ clear_access_bit(PPTE pte) {
     new.entire = old.entire;
     new.hardware.access = 0;
 
-    // Only try once because if we fail the page was just accessed
+    // Write will always succeed
+    // Given the function is currently holding the pte section lock, trimming thread cannot access
+    // So, set_access_bit would not work as the access bit is already valid; therefore, clearing will always succeed
     ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64((volatile LONG64 *) &pte->entire, (LONG64) new.entire, (LONG64) old.entire);
-
-    // TODO: change this name lowk
-    if (actual_value == old.entire) {
-        return TRUE;
-    }
-    return FALSE;
+    ASSERT(actual_value == old.entire);
+    return TRUE;
 }
 
 // PFN TABLE HELPERS
@@ -981,6 +981,7 @@ get_free_page() {
                 new.disc.disc = 1;
                 new.disc.disc_index = meta->disc_index;
 
+                // No need for a PTE lock because
                 ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64(
                     (volatile LONG64 *) &old_pte->entire,
                     (LONG64) new.entire, (LONG64) old.entire);
@@ -1041,7 +1042,6 @@ age_pages() {
 
         // Age from oldest to youngest skipping any pages that already reached the maximum age
         for (int age = NUM_AGES - 2; age >= 0; age--) {
-            // TODO: add a limit to the number of pages
             // Iterate through each page in the age bucket and age each PTE by one
             while (section->age_counts[age] > 0) {
                 // Remove and store the pointer to the head of the current age linked list
@@ -1061,7 +1061,7 @@ age_pages() {
                 // Therefore, its in a forever loop because it must fight the lock contention
                 while (TRUE) {
 
-                    // TODO: if never hit, remove
+                    // TODO: if never hit, remove. Instead chage to an ASSERT
                     // Check if the trimmer already got to it to prevent unnecessary calls
                     // And to get out of this forever loop
                     if (old.hardware.valid == 0) {
@@ -1208,6 +1208,7 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
 
 
     // Check the status of the PTE after releasing the lock as another thread could have altered its contents/status
+    // Necessary because I set my access bit without a PTE section lock; therefore, I must check before I continue
     // If the PTE does not satisfy a soft fault, return to full_virtual memory to force another page fault and reroute
     // to correct function that can resolve the fault
     if (pte->transition.transition != 1 || pte->transition.frame_number != pfn) {
@@ -1316,7 +1317,6 @@ handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
         my_temp_va_count = 0;
     }
 
-    // TODO: speculative faulting, doing more than needed
     // Map the data on the page's data onto the temp page before freeing the page
     PULONG_PTR temp_va = get_temp_va(my_temp_va_count);
 
@@ -2248,7 +2248,6 @@ full_virtual_memory_test (
             PTE_SECTION * section = get_section(pte);
 
             EnterCriticalSection(&section->lock);
-
             // During multithreading, this check prevents a thread from repeating the mapping process done by another thread
             if (pte->hardware.valid == 1) {
                 LeaveCriticalSection(&section->lock);
@@ -2261,6 +2260,7 @@ full_virtual_memory_test (
 
             // Check if in transition state (pfn is in modified or standby)
             if (pte->transition.transition == 1) {
+                // Hold the pte section lock when calling fault_resolution
                 fault_resolution = handle_soft_fault(pte, aligned_va, &meta, &pfn);
             }
             // DISK FAULT or ZERO FAULT
@@ -2499,6 +2499,8 @@ main (
 // TODO: add counter for how many emergency v. preemptive thread
 // TODO: QUESTION: is this truly necessary but modified list can chagne any time
 // TODO: optimize the aging locks to interlocked later
+// TODO: speculative faulting, doing more than needed
+
 
 // TODO: break into files
 // TODO: do we even need the 1 bit for 0 and active in pfn
