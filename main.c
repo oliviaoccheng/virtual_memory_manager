@@ -148,6 +148,7 @@
 // How many sections we age per call
 #define AGE_MIN_SECTIONS 4 // Minimum section
 #define AGE_MAX_SECTIONS 20 // Max sections to age at a time
+#define STANDBY_REFILL_BATCH 32 // Number of extra standby pages to repurpose during a get_free_pages call to add onto free list
 
 // Global to keep track of the dynamic batch size of the ager
 volatile LONG age_batch_sections = 10;
@@ -183,7 +184,7 @@ volatile LONG64 write_total_pages = 0;
 #endif
 
 // MISCALLANOUS
-#define TEMP_VA_SIZE 360 // Number of temp va slots for each thread
+#define TEMP_VA_SIZE 512 // Number of temp va slots for each thread
 
 // List Primitives
 // List Head Primitives to build Linked Lists
@@ -411,10 +412,21 @@ RemoveHeadList (
     PLIST_ENTRY ListHead
     )
 {
+    // TODO: batch remove head list for standby list, and repurpose several and put on free list
     PLIST_ENTRY Flink;
     PLIST_ENTRY Entry;
 
-    //
+    // TODO: parallelized acccess
+    // TODO: lock order: lock me, lock flink, lock blink
+    // TODO: if you are on the first, you have to lock head
+    // TODO: SRW LOCK
+    // TODO: during normal, do SRWLock
+    // TODO: people come in shared, try to do it the nice way X amount of times, and once you fail
+    // TODO: when they deadlock, they then let go, chane to get lock exclusive
+    // TODO: when count goes down to 0
+
+    // TODO: batch, try to do unlock for most, and then do that and do either MINIMUM or try
+    // TODO: do a bit map for the disc
     // Remove the entry currently at the head of the list.
     //
 
@@ -915,6 +927,120 @@ request_pages() {
 
 }
 
+// Get Free Pages Helpers
+// Repurposes multiple pages: one reserved for the faulting thread and the rest added to the free list
+pfn_metadata *
+repurpose_standby(VOID) {
+    EnterCriticalSection(&pfn_standby_list.lock);
+
+    // Verify that standby pages truly have pages available, under a lock
+    if (IsListEmpty(&pfn_standby_list.entry)) {
+        LeaveCriticalSection(&pfn_standby_list.lock);
+        return NULL;
+    }
+
+    // Go through the nodes of the standby list
+    PLIST_ENTRY head = &pfn_standby_list.entry;
+    PLIST_ENTRY first_page = head->Flink; // First entry in standby list
+    PLIST_ENTRY last_page = first_page; // Will hodl the value of the last page in our repurposed batch
+    ULONG_PTR count = 1;
+
+    // As long as there are entries on the standby list, and less than batch size
+    // Find where the batch ends, and store the pointer to that page
+    while (count < STANDBY_REFILL_BATCH && last_page->Flink != head) {
+        last_page = last_page->Flink;
+        count++;
+    }
+
+    // First page not in the repurpose batch
+    PLIST_ENTRY new_standby_head = last_page->Flink;
+
+    // Update the standby_list head to remove our batch
+    head->Flink = new_standby_head;
+    new_standby_head->Blink = head;
+
+    // Update the counter
+    pfn_standby_list.size -= count;
+
+    // Update our local batch list to ensure we can iterate through without accessing pointers to pages on standby
+    first_page->Blink = last_page;
+    last_page->Flink = first_page;
+
+    // The batch we just took off is private; hterefore, no need for a lock as it is not on any list
+    PLIST_ENTRY current = first_page;
+
+    // TODO: lowk if we are just going to iterate through the linked list, just remove off of standby one by one
+    // TODO: no point anymore to do batch off since we still have to hold the lock
+
+
+    // TODO: if you are batching off the standby, you have to ignore a locked lists' flink blink
+    for (ULONG_PTR i = 0; i < count; i += 1) {
+        PLIST_ENTRY next_page = current->Flink;
+
+        pfn_metadata * meta = (pfn_metadata *) current;
+        PPTE old_pte = meta->pte;
+
+        // Change the PTE from transition to disk format
+        while (TRUE) {
+            PTE old;
+            old.entire = old_pte->entire;
+
+            // Make the new PTE state
+            // Mark as invalid, not transition, in disc, and change PFN to disk address
+            PTE new;
+            new.entire = old.entire;
+            new.disc.valid = 0;
+            new.disc.transition = 0;
+            new.disc.disc = 1;
+            new.disc.disc_index = meta->disc_index;
+
+            // No need for a PTE lock because
+            ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64(
+                (volatile LONG64 *) &old_pte->entire,
+                (LONG64) new.entire, (LONG64) old.entire);
+
+            // Check if it successed
+            if (actual_value == old.entire) {
+                break;
+            }
+        }
+
+        meta->isOccupied = 1;
+        current = next_page;
+    }
+
+    LeaveCriticalSection(&pfn_standby_list.lock);
+
+    // Take the first of the newly repurposed pages
+    pfn_metadata * return_pfn = (pfn_metadata *) first_page;
+
+    // Add the remaining newly repurposed pages onto the free list
+    if (count > 1) {
+        // Get the first and last page of our newly repurposed pages to add onto free list
+        PLIST_ENTRY batch_first = first_page->Flink;
+        PLIST_ENTRY batch_last = last_page;
+
+        EnterCriticalSection(&pfn_free_list.lock);
+
+        // Get the current head and tail
+        PLIST_ENTRY free_head = &pfn_free_list.entry;
+        PLIST_ENTRY free_tail = free_head->Blink;
+
+        // Insert the newly repurposed pages into the free list
+        free_tail->Flink = batch_first;
+        batch_first->Blink = free_tail;
+        batch_last->Flink = free_head;
+        free_head->Blink = batch_last;
+
+        // Update the counter size
+        pfn_free_list.size += (count - 1);
+
+        LeaveCriticalSection(&pfn_free_list.lock);
+    }
+
+    return return_pfn;
+}
+
 // Page Helper
 pfn_metadata *
 get_free_page() {
@@ -954,56 +1080,12 @@ get_free_page() {
     // Without a lock, check if the standby list has pages. If so, verify. Else, continue.
     // Allows us to reduce lock contention
     if (IsListEmpty(&pfn_standby_list.entry) == FALSE) {
-        EnterCriticalSection(&pfn_standby_list.lock);
+        pfn_metadata * meta = repurpose_standby();
 
-        // Verify that standby pages truly have pages available
-        if (IsListEmpty(&pfn_standby_list.entry) == FALSE) {
-            // Move the list from the standby list
-            PLIST_ENTRY entry = RemoveHeadList(&pfn_standby_list.entry);
-            pfn_standby_list.size--;
-
-            pfn_metadata *meta = (pfn_metadata *) entry;
-
-            // Get the address of the pte related to the data in the standby page
-            PPTE old_pte = meta->pte;
-
-            // Change the PTE from transition to disk format
-            while (TRUE) {
-                PTE old;
-                old.entire = old_pte->entire;
-
-                // Make the new PTE state
-                // Mark as invalid, not transition, in disc, and change PFN to disk address
-                PTE new;
-                new.entire = old.entire;
-                new.disc.valid = 0;
-                new.disc.transition = 0;
-                new.disc.disc = 1;
-                new.disc.disc_index = meta->disc_index;
-
-                // No need for a PTE lock because
-                ULONG_PTR actual_value = (ULONG_PTR) InterlockedCompareExchange64(
-                    (volatile LONG64 *) &old_pte->entire,
-                    (LONG64) new.entire, (LONG64) old.entire);
-
-                // Check if it successed
-                if (actual_value == old.entire) {
-                    break;
-                }
-            }
-
-            my_repurpose_faults++;
-            // Set the page metadata to isOccupied
-            meta->isOccupied = 1;
-
-            // Release the lock after finishing
-            LeaveCriticalSection(&pfn_standby_list.lock);
-
+        if (meta != NULL) {
             pages_consumed++;
-
             return meta;
         }
-        LeaveCriticalSection(&pfn_standby_list.lock);
     }
 
     // Reset the event
@@ -1303,9 +1385,13 @@ handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
 
     }
 
+    // TODO: update my linear/random access to do some probability to go back to my recently viewed pages
+    // TODO: based on its success, we will see how successful i am at trimming/ even aging for choosing the appropriate candidates
     // Get the frame number of the free page using pointer arithmetic
     ULONG_PTR pfn = find_frame_number_from_pfn((meta));
 
+    // TODO: speculative reads. Idea that I am going linearly, to map several more pages then necessary
+    // TODO: track my success on speculative reads which would then dictate further premptiveness extra mapping
     // Check if the thread's temp VA space is full. If so, unmap before getiing a free slot
     if (my_temp_va_count == TEMP_VA_SIZE) {
         // Get the starting va of the thread's temp va space
@@ -2500,6 +2586,7 @@ main (
 // TODO: QUESTION: is this truly necessary but modified list can chagne any time
 // TODO: optimize the aging locks to interlocked later
 // TODO: speculative faulting, doing more than needed
+// TODO: assign priority to threads
 
 
 // TODO: break into files
@@ -2508,3 +2595,10 @@ main (
 // TODO: wtf do i never add stuff on the free_list
 // TODO: more free list?
 // TODO: add a thread to do memset 0 in the background
+
+
+// TODO: zero thre_thread that does memset for zero and standby
+// TODO: if we can repurpose something, we can repurpose a few more
+// TODO: multiple free list, one standby list
+// TODO: if im going to get a free list, the thread might as well grab a few more and put into the cache
+// TODO: instead of free list for each thread, just do tryEnter and do communal bunches
