@@ -29,6 +29,7 @@
 // bd = remove breakpoint (ex. bd 1 removes breakpoint 1)
 // ?? var_name = gives value of that variable
 // x = see list of globals
+// ba w8 address
 
 // Common debugger error codes
 // c0000005: access violation, touching memory you don't own
@@ -244,6 +245,7 @@ typedef struct {
     ULONG_PTR disc_index: MAX_DISC_PTE_BITS;
     ULONG_PTR isOccupied: 2; // 00-free, 01-active, 10-modified, 11-standby
     ULONG_PTR write_in_progress: 1; // 1: being written to disc
+    CRITICAL_SECTION lock;
 } pfn_metadata;
 
 typedef struct {
@@ -317,8 +319,8 @@ PULONG_PTR physical_page_numbers;
 // Number of physical pages that are actually allocated by the OS
 ULONG_PTR physical_page_count = NUMBER_OF_PHYSICAL_PAGES;
 
+// TODO: update the repurpose fault counters
 // Global Lists to keep track of the PFNs in each state
-LIST_HEAD pfn_free_list;
 LIST_HEAD pfn_modified_list;
 LIST_HEAD pfn_standby_list;
 
@@ -361,6 +363,11 @@ PPTE page_table;
 PTE_SECTION *pte_sections;
 // Number of PTEs per section
 ULONG_PTR ptes_per_section;
+
+// Array of free list heads
+LIST_HEAD free_lists[NUM_THREADS];
+volatile LONG64 total_free_pages = 0; // Estimate to avialble free pages
+volatile LONG free_list_hand = 0;
 
 // Forward function declarartion
 VOID trim_pages(void);
@@ -626,10 +633,11 @@ setup_pfn_table(PULONG_PTR physical_page_numbers, ULONG_PTR physical_page_count)
         pfn_metadata * pfn = &pfn_table[frame_number];
 
         memset(pfn, 0, sizeof(pfn_metadata));
-
-        InsertTailList(&pfn_free_list.entry, &pfn->list);
-        pfn_free_list.size++;
-    }
+        // Set up pfn per lock, single threaded no need for locks
+        int index = (int)(frame_number % NUM_THREADS);
+        InsertTailList(&free_lists[index].entry, &pfn->list);
+        free_lists[index].size++;
+        total_free_pages++;      }
 }
 
 pfn_metadata*
@@ -904,7 +912,7 @@ static BOOL
 need_to_write(void) {
     // Write to disk: if there are enough modified pages or if it is an emergency
     int modified = pfn_modified_list.size;
-    int supply = pfn_free_list.size + pfn_standby_list.size;   // free + standby
+    int supply = total_free_pages + pfn_standby_list.size;   // free + standby
     BOOL low_supply = (supply < EMERGENCY_LOW_BAR);
     return (modified >= WRITE_BATCH_SIZE) || (low_supply && modified > 0);
 }
@@ -928,6 +936,38 @@ request_pages() {
 }
 
 // Get Free Pages Helpers
+// Go through each free list to find a empty page
+pfn_metadata*
+    get_free_list_page (void) {
+    for (int i = 0; i < NUM_THREADS; i++) {
+        int index = (my_thread_id + i) % NUM_THREADS;
+        LIST_HEAD *curr_free_list = &free_lists[index];
+
+        // Move on if we can't obtain the lock
+        if (TryEnterCriticalSection(&curr_free_list->lock) == FALSE) {
+            continue;
+        }
+
+        // Check if it is empty
+        if (IsListEmpty(&curr_free_list->entry)) {
+            LeaveCriticalSection(&curr_free_list->lock);
+            continue;
+        }
+
+        PLIST_ENTRY entry = RemoveHeadList(&curr_free_list->entry);
+        curr_free_list->size--;
+
+        // Decrement the total free pages estimate counter
+        InterlockedDecrement64(&total_free_pages);
+
+        pfn_metadata * meta = (pfn_metadata *) entry;
+        meta->isOccupied = 1;
+
+        LeaveCriticalSection(&curr_free_list->lock);
+        return meta;
+    }
+    return NULL;
+}
 // Repurposes multiple pages: one reserved for the faulting thread and the rest added to the free list
 pfn_metadata *
 repurpose_standby(VOID) {
@@ -1020,10 +1060,14 @@ repurpose_standby(VOID) {
         PLIST_ENTRY batch_first = first_page->Flink;
         PLIST_ENTRY batch_last = last_page;
 
-        EnterCriticalSection(&pfn_free_list.lock);
+        // Update the free list hands so pages are distributed evenly across the many free lists
+        int index = (int) (InterlockedIncrement(&free_list_hand) % NUM_THREADS);
+        LIST_HEAD * curr_free_list = &free_lists[index];
+
+        EnterCriticalSection(&curr_free_list->lock);
 
         // Get the current head and tail
-        PLIST_ENTRY free_head = &pfn_free_list.entry;
+        PLIST_ENTRY free_head = &curr_free_list->entry;
         PLIST_ENTRY free_tail = free_head->Blink;
 
         // Insert the newly repurposed pages into the free list
@@ -1033,9 +1077,9 @@ repurpose_standby(VOID) {
         free_head->Blink = batch_last;
 
         // Update the counter size
-        pfn_free_list.size += (count - 1);
-
-        LeaveCriticalSection(&pfn_free_list.lock);
+        curr_free_list->size += (count - 1);
+        InterlockedAdd64(&total_free_pages, (LONG64) (count - 1));
+        LeaveCriticalSection(&curr_free_list->lock);
     }
 
     return return_pfn;
@@ -1045,35 +1089,23 @@ repurpose_standby(VOID) {
 pfn_metadata *
 get_free_page() {
     // Premptive trim
-    if (pfn_free_list.size + pfn_standby_list.size < TRIM_LOW_BAR) {
+    if (total_free_pages + pfn_standby_list.size < TRIM_LOW_BAR) {
         request_pages();
     }
 
     // Free: Check if the free list is empty without a lock, if so, continue
     // If not, verify status, and proceed to take a page
-    if (IsListEmpty(&pfn_free_list.entry) == FALSE) {
-        // Claim the lock
-        EnterCriticalSection(&pfn_free_list.lock);
+    // TODO: make it a read, interlocked
+    if (total_free_pages > 0) {
+        // Try to go through the many free lists to find a free page
+        // Not guarnteed
+        pfn_metadata * meta = get_free_list_page();
 
-        // Verify if the value truly has pages
-        if (IsListEmpty(&pfn_free_list.entry) == FALSE) {
-            // Move the list from the free list
-            PLIST_ENTRY entry = RemoveHeadList(&pfn_free_list.entry);
-            pfn_free_list.size--;
-
-            pfn_metadata *meta = (pfn_metadata *) entry;
-
-            // Set the page metadata to isOccupied
-            meta->isOccupied = 1;
-
-            // Release the lock after finishing
-            LeaveCriticalSection(&pfn_free_list.lock);
-
+        // Successfully retrieved a page
+        if (meta != NULL) {
             pages_consumed++;
-
             return meta;
         }
-        LeaveCriticalSection(&pfn_free_list.lock);
     }
 
     // Standby: Repurpose the page from the standby list
@@ -1109,6 +1141,7 @@ get_temp_va(int k) {
     ULONG_PTR temp_start = (ULONG_PTR)my_thread_id * TEMP_VA_SIZE;
     return (PULONG_PTR)((PBYTE)fault_va_start + (temp_start + k) * PAGE_SIZE);
 }
+
 
 // Aging
 VOID
@@ -1228,13 +1261,20 @@ consumption_rate() {
     DEBUG_PRINT("[CONSUME] %llu pages/tick (~%llu pages/sec) | free=%llu standby=%llu modified=%llu\n",
         (unsigned long long)avg_per_tick,
         (unsigned long long)(avg_per_tick * 1000 / CONSUMPTION_TICK),
-        (unsigned long long)pfn_free_list.size,
+        (ULONG64)total_free_pages,
         (unsigned long long)pfn_standby_list.size,
         (unsigned long long)pfn_modified_list.size);
+    DEBUG_PRINT("[FREE DIST] free1=%llu free2=%llu free3=%llu free4=%llu free5=%llu total=%lld\n",
+        (unsigned long long)free_lists[0].size,
+        (unsigned long long)free_lists[1].size,
+        (unsigned long long)free_lists[2].size,
+        (unsigned long long)free_lists[3].size,
+        (unsigned long long)free_lists[4].size,
+        (LONG64)total_free_pages);
 
     if (avg_per_tick > 0) {
         // At this rate, how many ticks until we run out of available pages without trimming/writing to disk
-        ULONG_PTR remaining_ticks = (pfn_free_list.size + pfn_standby_list.size) / avg_per_tick;
+        ULONG_PTR remaining_ticks = ((ULONG64) total_free_pages + pfn_standby_list.size) / avg_per_tick;
 
         // Caclulate the dynamic batch size for the aging thread
         // For emergencies, do max aging sections
@@ -1541,7 +1581,7 @@ write_thread (LPVOID lpParam) {
 
         // Double check if a write is actually warranted as states might have changed
         if (!need_to_write()) {
-            if (pfn_free_list.size + pfn_standby_list.size > 0) {
+            if ((ULONG64)total_free_pages + pfn_standby_list.size > 0) {
                 SetEvent(pages_available);
             }
             continue;
@@ -1558,7 +1598,7 @@ write_thread (LPVOID lpParam) {
             // printf("WRITE THREAD: Disk is full\n");
 
             // Check if there are free pages or standby list pages
-            if (pfn_standby_list.size > 0 || pfn_free_list.size > 0) {
+            if (pfn_standby_list.size > 0 || (ULONG64)total_free_pages > 0) {
                 // Allow repurpose and signal finished of trim and write thread
                 SetEvent(pages_available);
                 // Update the trim thread activity after pages are avaialble to prevent other thread's repeadtely calling
@@ -1909,7 +1949,7 @@ trim_pages() {
     QueryPerformanceCounter(&t0);
 
     // If trim pages was unneccarily called, check if it is low or now
-    if (pfn_standby_list.size + pfn_free_list.size >= TRIM_BATCH_SIZE) {
+    if (pfn_standby_list.size + (ULONG64)total_free_pages >= TRIM_BATCH_SIZE) {
         SetEvent(pages_available);
         return;
     }
@@ -1951,9 +1991,11 @@ initialize_system() {
     HANDLE physical_page_handle;
     ULONG_PTR virtual_address_size;
 
-    initialize_list_head(&pfn_free_list);
     initialize_list_head(&pfn_modified_list);
     initialize_list_head(&pfn_standby_list);
+    for (int i = 0; i < NUM_THREADS; i++) {
+        initialize_list_head(&free_lists[i]);
+    }
 
     // Initialize the multithreading locks
     InitializeCriticalSectionAndSpinCount(&disc_lock, 0x00FFFFFF);
