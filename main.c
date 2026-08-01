@@ -154,16 +154,6 @@
 // Global to keep track of the dynamic batch size of the ager
 volatile LONG age_batch_sections = 10;
 
-// Track the duration and volume of trim calls
-volatile LONG64 trim_total_qpc = 0;
-volatile LONG   trim_call_count = 0;
-volatile LONG64 trim_total_pages = 0;
-
-volatile LONG64 write_map_qpc = 0;    // the two MapUserPhysicalPages calls
-volatile LONG64 write_memcpy_qpc = 0; // the per-page memcpy loop
-volatile LONG   write_call_count = 0;
-volatile LONG64 write_total_pages = 0;
-
 // Multiple VA support
 #define SUPPORT_MULTIPLE_VA_TO_SAME_PAGE 1
 #pragma comment(lib, "advapi32.lib")
@@ -182,6 +172,29 @@ volatile LONG64 write_total_pages = 0;
 #else
 #define ASSERT(x)
 #define DEBUG_PRINT(...)
+#endif
+
+#define DIAGNOSTICS 0
+#if DIAGNOSTICS
+  #define DIAG_QPC(x)          QueryPerformanceCounter(x)
+  #define DIAG_ADD64(dst, val) InterlockedAdd64(&(dst), (val))
+  #define DIAG_INC(dst)        InterlockedIncrement(&(dst))
+  #define DIAG_DECL(decl)      decl
+#else
+  #define DIAG_QPC(x)          ((void)0)
+  #define DIAG_ADD64(dst, val) ((void)0)
+  #define DIAG_INC(dst)        ((void)0)
+  #define DIAG_DECL(decl)
+#endif
+
+#if DIAGNOSTICS
+volatile LONG64 trim_total_qpc = 0;
+volatile LONG   trim_call_count = 0;
+volatile LONG64 trim_total_pages = 0;
+volatile LONG64 write_map_qpc = 0;
+volatile LONG64 write_memcpy_qpc = 0;
+volatile LONG   write_call_count = 0;
+volatile LONG64 write_total_pages = 0;
 #endif
 
 // MISCALLANOUS
@@ -863,17 +876,17 @@ write_to_disk (int count, pfn_metadata ** pages_to_write, ULONG_PTR * disc_slots
     }
 
     // Map multiple pages to sys VA at once for efficiency
-    QueryPerformanceCounter(&t0);
+    DIAG_QPC(&t0);
     if (MapUserPhysicalPages((PVOID) system_va_start, count, pfn_array) == FALSE) {
         printf("WRITE TO DISK: map failed, count=%d\n", count);
         DebugBreak();
         return;
     }
-    QueryPerformanceCounter(&t1);
-    InterlockedAdd64(&write_map_qpc, t1.QuadPart - t0.QuadPart);
+    DIAG_QPC(&t1);
+    DIAG_ADD64(write_map_qpc, t1.QuadPart - t0.QuadPart);
 
     // Copy the data from the page to the disk
-    QueryPerformanceCounter(&t0);
+    DIAG_QPC(&t0);
     for (int i = 0; i < count; i += 1) {
         // Find the system slots va
         PULONG_PTR system_slot = (PULONG_PTR) ((PBYTE)system_va_start + i * PAGE_SIZE);
@@ -895,17 +908,17 @@ write_to_disk (int count, pfn_metadata ** pages_to_write, ULONG_PTR * disc_slots
         // Save the free disc slot into an array
         disc_slots[i] = disc_slot;
     }
-    QueryPerformanceCounter(&t1);
-    InterlockedAdd64(&write_memcpy_qpc, t1.QuadPart - t0.QuadPart);
+    DIAG_QPC(&t1);
+    DIAG_ADD64(write_memcpy_qpc, t1.QuadPart - t0.QuadPart);
 
-    QueryPerformanceCounter(&t0);
+    DIAG_QPC(&t0);
     // Batch unmap: use mapUserPhysicalPages given all slots are contigous
     if (MapUserPhysicalPages((PVOID)system_va_start, count, NULL) == FALSE) {
         printf("WRITE TO DISK: batch unmap map failed, count=%d\n", count);
         DebugBreak();
     }
-    QueryPerformanceCounter(&t1);
-    InterlockedAdd64(&write_map_qpc, t1.QuadPart - t0.QuadPart);
+    DIAG_QPC(&t1);
+    DIAG_ADD64(write_map_qpc, t1.QuadPart - t0.QuadPart);
 }
 
 static BOOL
@@ -1651,8 +1664,8 @@ write_thread (LPVOID lpParam) {
 
         // Update the write thread active status
         write_to_disk(num_pages_written, pages_to_write, disc_slots);
-        InterlockedIncrement(&write_call_count);
-        InterlockedAdd64(&write_total_pages, num_pages_written);
+        DIAG_INC(write_call_count);
+        DIAG_ADD64(write_total_pages, num_pages_written);
 
         EnterCriticalSection(&pfn_modified_list.lock);
         EnterCriticalSection(&pfn_standby_list.lock);
@@ -1942,11 +1955,8 @@ VOID
 trim_pages() {
     // Query Performance Frequency: tells how many ticks per second the performance counter useees
     // Query PerformanceCounter: gives the slapsed ticks
-    LARGE_INTEGER freq, t0, t1;
-    // Finds the tick rate of the machine
-    QueryPerformanceFrequency(&freq);
-    // Grabs the current value of that same counter
-    QueryPerformanceCounter(&t0);
+    DIAG_DECL(LARGE_INTEGER t0; LARGE_INTEGER t1;)
+    DIAG_QPC(&t0);
 
     // If trim pages was unneccarily called, check if it is low or now
     if (pfn_standby_list.size + (ULONG64)total_free_pages >= TRIM_BATCH_SIZE) {
@@ -1970,11 +1980,10 @@ trim_pages() {
             total_pages_trimmed += trim_a_section(&pte_sections[i], section_batch_size, TRUE, TRUE);
         }
     }
-    QueryPerformanceCounter(&t1);
-    // Allows the counters to be updated without fear of overlapping threads
-    InterlockedAdd64(&trim_total_qpc, t1.QuadPart - t0.QuadPart);
-    InterlockedIncrement(&trim_call_count);
-    InterlockedAdd64(&trim_total_pages, total_pages_trimmed);
+    DIAG_QPC(&t1);
+    DIAG_ADD64(trim_total_qpc, t1.QuadPart - t0.QuadPart);
+    DIAG_INC(trim_call_count);
+    DIAG_ADD64(trim_total_pages, total_pages_trimmed);
 }
 
 //
@@ -2580,18 +2589,20 @@ main (
         printf("\n");
     }
 
-    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
-    double trim_ms  = 1000.0 * trim_total_qpc  / freq.QuadPart;
-    double wmap_ms  = 1000.0 * write_map_qpc   / freq.QuadPart;
-    double wcpy_ms  = 1000.0 * write_memcpy_qpc/ freq.QuadPart;
+    #if DIAGNOSTICS
+        LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
+        double trim_ms = 1000.0 * trim_total_qpc / freq.QuadPart;
+        double wmap_ms = 1000.0 * write_map_qpc  / freq.QuadPart;
+        double wcpy_ms = 1000.0 * write_memcpy_qpc / freq.QuadPart;
+        printf("new sttats to determine if im failing on the algorithms or the numbers or both\n");
+        printf("TRIM:  %d calls, %.1f ms total, %.3f ms/call, %.1f pages/call\n",
+            trim_call_count, trim_ms, trim_call_count ? trim_ms / trim_call_count : 0.0,
+            trim_call_count ? (double)trim_total_pages / trim_call_count : 0.0);
+        printf("WRITE: %d calls, map=%.1fms memcpy=%.1fms, %.1f pages/call\n",
+            write_call_count, wmap_ms, wcpy_ms,
+            write_call_count ? (double)write_total_pages / write_call_count : 0.0);
+#endif
 
-    printf("new sttats to determine if im failing on the algorithms or the numbers or both\n");
-    printf("TRIM:  %d calls, %.1f ms total, %.3f ms/call, %.1f pages/call\n",
-        trim_call_count, trim_ms, trim_call_count ? trim_ms / trim_call_count : 0.0,
-        trim_call_count ? (double)trim_total_pages / trim_call_count : 0.0);
-    printf("WRITE: %d calls, map=%.1fms memcpy=%.1fms, %.1f pages/call\n",
-        write_call_count, wmap_ms, wcpy_ms,
-        write_call_count ? (double)write_total_pages / write_call_count : 0.0);
     printf("Total time for all workload: %.2f ms\n", total_ms);
     printf("Total accesses across threads: %lld\n", all_accesses);
 
