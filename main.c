@@ -124,9 +124,9 @@
 // The bar we have to meet to trigger trimming measured by free+standby count
 #define TRIM_LOW_BAR 500
 #define EMERGENCY_LOW_BAR 120
-#define TRIM_BATCH_SIZE 500 // How many pages to trim per batch
+#define TRIM_BATCH_SIZE 800 // How many pages to trim per batch
 // TODO: later make this number dynamic based on pressure instead of constat
-#define MINIMUM_TRIM_SIZE (TRIM_BATCH_SIZE / 4)
+#define MINIMUM_TRIM_SIZE (TRIM_BATCH_SIZE / 2)
 // Number of modified pages we want before writing to disk
 // Number can't exceed the disk size
 # define WRITE_BATCH_SIZE 500
@@ -174,7 +174,7 @@ volatile LONG age_batch_sections = 10;
 #define DEBUG_PRINT(...)
 #endif
 
-#define DIAGNOSTICS 0
+#define DIAGNOSTICS 1
 #if DIAGNOSTICS
   #define DIAG_QPC(x)          QueryPerformanceCounter(x)
   #define DIAG_ADD64(dst, val) InterlockedAdd64(&(dst), (val))
@@ -199,6 +199,7 @@ volatile LONG64 write_total_pages = 0;
 
 // MISCALLANOUS
 #define TEMP_VA_SIZE 512 // Number of temp va slots for each thread
+#define MINIMUM_WRITE_SIZE 200
 
 // List Primitives
 // List Head Primitives to build Linked Lists
@@ -351,6 +352,18 @@ LIST_ENTRY disc_free_list;
 // Keeps track of the age hand
 ULONG_PTR age_hand = 0;
 
+// Emergency vs preemptive trim tracking
+volatile LONG emergency_trim_count = 0;   // worker ran dry, forced trim
+volatile LONG preemptive_trim_count = 0;  // consumption_rate got ahead of it
+volatile LONG stall_count = 0;            // worker actually blocked on pages_available
+volatile LONG64 emergency_pages_trimmed = 0;
+volatile LONG64 preemptive_pages_trimmed = 0;
+
+// Flag set by the emergency path, read+cleared by trim_pages
+volatile LONG trim_is_emergency = 0;
+
+volatile ULONG last_avg_per_tick;
+
 // Per-thread stats
 // __declspec(thread) keyword: allows each thread to have it's own private copy of the below variables that act as globals
 __declspec(thread) int my_hard_faults = 0;
@@ -364,7 +377,7 @@ __declspec(thread) int my_temp_va_count = 0; // How many slots currently using
 ThreadStats final_results[NUM_THREADS];
 
 // Consumption
-ULONG_PTR pages_consumed = 0;
+volatile ULONG64 pages_consumed = 0;
 ULONG_PTR history[HISTORY_LENGTH] = {0};
 int history_index = 0;
 ULONG_PTR last_pages_consumed = 0;
@@ -925,20 +938,32 @@ static BOOL
 need_to_write(void) {
     // Write to disk: if there are enough modified pages or if it is an emergency
     int modified = pfn_modified_list.size;
-    int supply = total_free_pages + pfn_standby_list.size;   // free + standby
-    BOOL low_supply = (supply < EMERGENCY_LOW_BAR);
-    return (modified >= WRITE_BATCH_SIZE) || (low_supply && modified > 0);
+    int supply = total_free_pages + pfn_standby_list.size;
+
+    // full batch, have enough of modified pages to write to disk
+    if (modified >= WRITE_BATCH_SIZE) {
+        return TRUE;
+    }
+
+    BOOL emergency = (supply < EMERGENCY_LOW_BAR);
+    // Write when there is an emergency but also ensure that there is enough modified pages to make it worthwhile
+    return emergency && modified >= MINIMUM_WRITE_SIZE;
 }
 
 // IN order, to get free list, we need more standby
 VOID
-request_pages() {
+request_pages(BOOL is_emergency) {
     // If I have pages worth writing: modified met full batch or emergency with some modified pages
     if (need_to_write()) {
         if (InterlockedCompareExchange(&write_thread_active, 1, 0) == 0) {
             SetEvent(write_needed);
         }
-        return;
+        // Continue, so we can also consider the need for trimming
+    }
+
+    // Record if this is an emergency, which helps the trimmer calculuate batch_size
+    if (is_emergency) {
+        InterlockedExchange(&trim_is_emergency, 1);
     }
 
     // If there are not enough modified pages to write, must trim
@@ -1103,7 +1128,7 @@ pfn_metadata *
 get_free_page() {
     // Premptive trim
     if (total_free_pages + pfn_standby_list.size < TRIM_LOW_BAR) {
-        request_pages();
+        request_pages(FALSE);
     }
 
     // Free: Check if the free list is empty without a lock, if so, continue
@@ -1116,7 +1141,7 @@ get_free_page() {
 
         // Successfully retrieved a page
         if (meta != NULL) {
-            pages_consumed++;
+            InterlockedIncrement64(&pages_consumed);
             return meta;
         }
     }
@@ -1128,14 +1153,15 @@ get_free_page() {
         pfn_metadata * meta = repurpose_standby();
 
         if (meta != NULL) {
-            pages_consumed++;
+            InterlockedIncrement64(&pages_consumed);
             return meta;
         }
     }
 
     // Reset the event
     ResetEvent(pages_available);
-    request_pages();
+    // Failed to get any pages on free or standby, must trim
+    request_pages(TRUE);
     return NULL;
 }
 
@@ -1247,6 +1273,49 @@ age_pages() {
 }
 
 // CONSUMPTION
+// Must gurantee to at least trim one page, since every call means that trim was either triggered preemtpively or emergency
+LONG
+compute_trim_size(BOOL is_emergency) {
+    // If its an emergency, worker is blocked right now; therefore, quickly trim some available pages
+    if (is_emergency) {
+        return MINIMUM_TRIM_SIZE;
+    }
+
+    // Prememptive trim batch size
+    ULONG_PTR supply = (ULONG64)total_free_pages + pfn_standby_list.size;
+
+    ULONG rate = InterlockedCompareExchange(&last_avg_per_tick, 0, 0);
+    ULONG_PTR demand = rate * MIN_TICK_THRESHOLD;
+    ULONG_PTR demand_gap;
+
+    if (demand > supply) {
+        // Number of pages needed based on the consumption rate
+        demand_gap = demand - supply;
+    } else {
+        // Meeting the demand
+        demand_gap = 0;
+    }
+
+    // Number of pages I lack right now
+    LONG deficit = (LONG) (TRIM_LOW_BAR - supply);
+    LONG trim_size;
+
+    // Take the number that is bigger: deficit v. demand gap
+    if (demand_gap > deficit) {
+        trim_size = demand_gap;
+    } else {
+        trim_size = deficit;
+    }
+
+    // Set a ceiling
+    if (trim_size > TRIM_BATCH_SIZE) {
+        trim_size = TRIM_BATCH_SIZE;
+    } else if (trim_size < 0) {
+        trim_size = 0;
+    }
+
+    return trim_size;
+}
 VOID
 consumption_rate() {
     // Read how many pages were consumed since last tick
@@ -1266,6 +1335,7 @@ consumption_rate() {
     }
     // Average pages consumed per tick during this window of time
     ULONG_PTR avg_per_tick = total / HISTORY_LENGTH;
+    InterlockedExchange(&last_avg_per_tick, avg_per_tick);
 
     // Find batch size for aging but use the constant as a baseline
     int age_batch_size = AGE_MIN_SECTIONS;
@@ -1306,15 +1376,10 @@ consumption_rate() {
             age_batch_size = AGE_MAX_SECTIONS;
         }
 
-        if (remaining_ticks < MIN_TICK_THRESHOLD) {
-            request_pages();
-        }
-
         // Use Interlocked operations to ensure that the value is protected when age_pages is reading it
         InterlockedExchange(&age_batch_sections, age_batch_size);
         SetEvent(age_needed);
     }
-
 }
 
 // Fault Handler
@@ -1423,6 +1488,7 @@ handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
     while (meta == NULL) {
         // Release the pte section lock to allow the trim thread to work
         LeaveCriticalSection(&section->lock);
+        InterlockedIncrement(&stall_count);
 
         // Wait for the trim to finish
         WaitForSingleObject(pages_available, INFINITE);
@@ -1604,6 +1670,9 @@ write_thread (LPVOID lpParam) {
         // No need for lock as the worker threads that have access to these variables would only increase the amount
         // of empty slots; therefore, the number of available disc slots would increase which does not affect our code
         int available_disc_slots =  disc_page_count - filled_disc_slots;
+
+        DEBUG_PRINT("[WRITE] modified=%llu avail_disc_slots=%d filled=%d/%llu\n",
+        (unsigned long long)pfn_modified_list.size, available_disc_slots, filled_disc_slots, (unsigned long long)disc_page_count);
 
         // If there are no empty slots
         if (available_disc_slots <= 0) {
@@ -1958,9 +2027,18 @@ trim_pages() {
     DIAG_DECL(LARGE_INTEGER t0; LARGE_INTEGER t1;)
     DIAG_QPC(&t0);
 
-    // If trim pages was unneccarily called, check if it is low or now
-    if (pfn_standby_list.size + (ULONG64)total_free_pages >= TRIM_BATCH_SIZE) {
-        SetEvent(pages_available);
+    // Read and clear the emergency flag. Use it for stats and trimming batch_size
+    int was_emergency = (int) InterlockedExchange(&trim_is_emergency, 0);
+    if (was_emergency) {
+        InterlockedIncrement(&emergency_trim_count);
+    } else {
+        InterlockedIncrement(&preemptive_trim_count);
+    }
+
+    ULONG_PTR batch_size = compute_trim_size(was_emergency);
+
+    // Prevent redundancy
+    if (batch_size <= 0) {
         return;
     }
 
@@ -1968,15 +2046,15 @@ trim_pages() {
 
     // Pass 1: optimized to skip any pages with an access bit or any section that it can't get it's section lock on the first try
     // Essentially skip busy PTE sections and hot pages
-    for (int i = 0; i < NUM_PTE_SECTIONS && total_pages_trimmed < TRIM_BATCH_SIZE; i++) {
-        int section_batch_size = TRIM_BATCH_SIZE - total_pages_trimmed;
+    for (int i = 0; i < NUM_PTE_SECTIONS && total_pages_trimmed < batch_size; i++) {
+        int section_batch_size = batch_size - total_pages_trimmed;
         total_pages_trimmed += trim_a_section(&pte_sections[i], section_batch_size, FALSE, FALSE);
     }
 
     // Pass 2: if Pass 1 failed to trim enough. wait for every section lock and ignore the access bit
-    if (total_pages_trimmed < MINIMUM_TRIM_SIZE) {
-        for (int i = 0; i < NUM_PTE_SECTIONS && total_pages_trimmed < TRIM_BATCH_SIZE; i++) {
-            int section_batch_size = TRIM_BATCH_SIZE - total_pages_trimmed;
+    if (total_pages_trimmed < batch_size) {
+        for (int i = 0; i < NUM_PTE_SECTIONS && total_pages_trimmed < batch_size; i++) {
+            int section_batch_size = batch_size - total_pages_trimmed;
             total_pages_trimmed += trim_a_section(&pte_sections[i], section_batch_size, TRUE, TRUE);
         }
     }
@@ -1984,6 +2062,12 @@ trim_pages() {
     DIAG_ADD64(trim_total_qpc, t1.QuadPart - t0.QuadPart);
     DIAG_INC(trim_call_count);
     DIAG_ADD64(trim_total_pages, total_pages_trimmed);
+
+    if (was_emergency) {
+        InterlockedAdd64(&emergency_pages_trimmed, total_pages_trimmed);
+    } else {
+        InterlockedAdd64(&preemptive_pages_trimmed, total_pages_trimmed);
+    }
 }
 
 //
@@ -2589,6 +2673,17 @@ main (
         printf("\n");
     }
 
+    printf("\nTRIM BEHAVIOR\n");
+    printf("Preemptive trims: %ld (%lld pages)\n",
+        preemptive_trim_count, (long long)preemptive_pages_trimmed);
+    printf("Emergency trims:  %ld (%lld pages)\n",
+        emergency_trim_count, (long long)emergency_pages_trimmed);
+    printf("Worker stalls (blocked on pages_available): %ld\n", stall_count);
+    long total_trims = preemptive_trim_count + emergency_trim_count;
+    if (total_trims > 0) {
+        printf("Emergency ratio: %.1f%%\n",
+            100.0 * emergency_trim_count / total_trims);
+    }
     #if DIAGNOSTICS
         LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
         double trim_ms = 1000.0 * trim_total_qpc / freq.QuadPart;
