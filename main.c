@@ -174,7 +174,7 @@ volatile LONG age_batch_sections = 10;
 #define DEBUG_PRINT(...)
 #endif
 
-#define DIAGNOSTICS 1
+#define DIAGNOSTICS 0
 #if DIAGNOSTICS
   #define DIAG_QPC(x)          QueryPerformanceCounter(x)
   #define DIAG_ADD64(dst, val) InterlockedAdd64(&(dst), (val))
@@ -200,6 +200,12 @@ volatile LONG64 write_total_pages = 0;
 // MISCALLANOUS
 #define TEMP_VA_SIZE 512 // Number of temp va slots for each thread
 #define MINIMUM_WRITE_SIZE 200
+
+// Number of tries a thread takes to attempt to obtain the locks of the three ndoes
+// After that many fails, we go to the hard route
+#define RW_LIST_MAX_FAILS 30
+// Amount of time you wait after each retry after trying to obtain a lock, so we give time for other threads to finish
+#define RW_LIST_MAX_WAITING_PERIOD 64
 
 // List Primitives
 // List Head Primitives to build Linked Lists
@@ -252,13 +258,26 @@ typedef struct {
     ULONG_PTR size;
 } LIST_HEAD, * PLIST_HEAD;
 
+// RW locked list: allows multiple threads to touch a list at a time, reducing lock contention
+// For shared lock: a thread needs to get the pfn individual lock of 3 nodes the node itself, the flink, and its blink
+// For exclusive lock: wait for all threads to let go of their shared lock, and then grab the head lock list
+typedef struct RW_LIST_HEAD {
+    LIST_ENTRY entry;
+    volatile LONG64 size;
+    // Allows two routes: fast (shared lock) and slow (exclusive lock)
+    SRWLOCK rw_lock;
+    CRITICAL_SECTION head_lock;
+} RW_LIST_HEAD, *PRW_LIST_HEAD;
+
 // Custom struct for our PFNs
 typedef struct {
     LIST_ENTRY list;
     PPTE pte;
-    ULONG_PTR disc_index: MAX_DISC_PTE_BITS;
-    ULONG_PTR isOccupied: 2; // 00-free, 01-active, 10-modified, 11-standby
-    ULONG_PTR write_in_progress: 1; // 1: being written to disc
+    ULONG_PTR disc_index; // MAX_DISC_PTE_BITS;
+    // Had to make these ULONG by themselves as previously they shared the same physical space
+    // As a result, the read write between two threads resulted in stale data
+    ULONG_PTR isOccupied; // 2 bits// 00-free, 01-active, 10-modified, 11-standby
+    ULONG_PTR write_in_progress; // 1 bits; // 1: being written to disc
     CRITICAL_SECTION lock;
 } pfn_metadata;
 
@@ -336,7 +355,7 @@ ULONG_PTR physical_page_count = NUMBER_OF_PHYSICAL_PAGES;
 // TODO: update the repurpose fault counters
 // Global Lists to keep track of the PFNs in each state
 LIST_HEAD pfn_modified_list;
-LIST_HEAD pfn_standby_list;
+RW_LIST_HEAD pfn_standby_list;
 
 // Disc
 // Initialize disc
@@ -503,6 +522,402 @@ initialize_list_head(PLIST_HEAD head) {
     return;
 }
 
+// RW List Helpers
+// Function that returns the individual lock that guards either the list head or the page
+// Helps streamline the logic in the edge cases when we are trying to lock the blink, which happens to be the head
+CRITICAL_SECTION*
+    get_node_lock(PRW_LIST_HEAD list, PLIST_ENTRY entry) {
+    // If its the list head, return the head_lock from the RW list struct
+    if (entry == &list->entry) {
+        return &list->head_lock;
+    }
+
+    // If its a page, return the individual lock per pfn
+    // Cast the list_entry to pfn_metadata to get the page's lock
+    pfn_metadata * pfn = (pfn_metadata*) entry;
+    return &pfn->lock;
+}
+
+// Controls the waiting period after failing to grap a list_entry lock in a RW list
+// Pause to let other threads finish and release the lock
+// Idea is for the waiting period increase after the number of fails
+VOID
+failed_rw_waiting_period(ULONG_PTR num_fails) {
+    // Initial rate is 1:1
+    ULONG_PTR spin = num_fails;
+
+    // Ensure we don't wait forever, so cap it
+    if (spin > RW_LIST_MAX_WAITING_PERIOD) {
+        spin = RW_LIST_MAX_WAITING_PERIOD;
+    }
+
+    // Enact the waiting period by calling Yield Processor
+    // Yield Processor: CPU instruction that lets a thread spin in place waiting, without full power. Waits without going to sleep
+    for (ULONG_PTR i = 0; i < spin; i++) {
+        YieldProcessor();
+    }
+}
+
+// Initializes the RW Locked list
+VOID
+initialize_RW_list(PRW_LIST_HEAD list) {
+    // Ensure the list is empty with Flink Blink poiting to itself
+    InitializeListHead(&list->entry);
+    list->size = 0;
+
+    // Initialize shared/exlcusive lock and the head lock
+    InitializeSRWLock(&list->rw_lock);
+    InitializeCriticalSectionAndSpinCount(&list->head_lock, 0x00FFFFFF);
+}
+
+// Helper function to insert the tail at the end of a RW list
+// Need to edit two fieds: the head_lock and the current_tail's pfn lock
+// Two ways: optimized and then slow, after X amount of TryEnter
+VOID
+insert_tail_RW_list(PRW_LIST_HEAD list, pfn_metadata * pfn) {
+    // Enter the optimized route by grabbing the shared lock
+    AcquireSRWLockShared(&list->rw_lock);
+
+    // Keep track of number of fails that will dictate when we leave and how long our waiting period is
+    ULONG_PTR num_fails = 0;
+
+    while (TRUE) {
+        // Try to grab the head_lock since we need to change its Flink
+        if (TryEnterCriticalSection(&list->head_lock) == FALSE) {
+            num_fails++;
+
+            // Continue to wait, and then try again until we tried enough times
+            if (num_fails < RW_LIST_MAX_FAILS) {
+                failed_rw_waiting_period(num_fails);
+                continue;
+            }
+
+            // Failed too many times, try to go exclusive route
+            break;
+        }
+
+        // Find the current tail and get its lock
+        PLIST_ENTRY tail = list->entry.Blink;
+        CRITICAL_SECTION * tail_lock = get_node_lock(list, tail);
+
+        // Edge case: if the list is empty, the tail is equivalent to the head lock given the logic of get_node_lock
+        // Double check
+        BOOLEAN same_lock = FALSE;
+        if (tail_lock == &list->head_lock) {
+            same_lock = TRUE;
+        }
+
+        // If the list is not empty, need to get the tail_lock
+        if (same_lock == FALSE) {
+            if (TryEnterCriticalSection(tail_lock) == FALSE) {
+                // If we couldn't get the tail lock, release all your current locks, and wait, hoping for the other threads to finish
+                LeaveCriticalSection(&list->head_lock);
+
+                num_fails++;
+
+                if (num_fails < RW_LIST_MAX_FAILS) {
+                    failed_rw_waiting_period(num_fails);
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        // Successfully obtained all the locks
+        // Add the new pfn to the tail
+        InsertTailList(&list->entry, &pfn->list);
+        InterlockedIncrement64(&list->size);
+
+        // Release the locks
+        if (same_lock == FALSE) {
+            LeaveCriticalSection(tail_lock);
+        }
+
+        // Release the head_lock
+        LeaveCriticalSection(&list->head_lock);
+        ReleaseSRWLockShared(&list->rw_lock);
+        return;
+    }
+
+    // Slower route after breaking out of the while after failing too many times
+    // Try to make the list Exclusive, so we are the only thread
+    ReleaseSRWLockShared(&list->rw_lock);
+    AcquireSRWLockExclusive(&list->rw_lock);
+
+    InsertTailList(&list->entry, &pfn->list);
+    InterlockedIncrement64(&list->size);
+
+    ReleaseSRWLockExclusive(&list->rw_lock);
+
+}
+
+// Helper to remove a page off a RW list
+// When called, caller holds its own page's lock
+// Need to change its surronding Node's flink blink
+VOID
+remove_entry_RW_list(PRW_LIST_HEAD list, pfn_metadata * pfn) {
+    // Try the optimized route
+    AcquireSRWLockShared(&list->rw_lock);
+
+    // Counter to keep track of how many times we fail to get the lock, caculating the waiting period and when we give up
+    ULONG_PTR num_fails = 0;
+
+    while (TRUE) {
+        // Grab its linked list field
+        PLIST_ENTRY entry = &pfn->list;
+
+        // Check if its already unlinked, meaning another thread softfaulted on this entry
+        if (entry->Flink == NULL) {
+            ReleaseSRWLockShared(&list->rw_lock);
+            return;
+        }
+
+        // Try to obtain the neighbors locks, starting with the Flink
+        PLIST_ENTRY flink = entry->Flink;
+        PLIST_ENTRY blink = entry->Blink;
+        CRITICAL_SECTION * flink_lock = get_node_lock(list, flink);
+        CRITICAL_SECTION * blink_lock = get_node_lock(list, blink);
+
+        // Try to grab the flink's lock
+        if (TryEnterCriticalSection(flink_lock) == FALSE) {
+            num_fails++;
+
+            // Go to the waiting period
+            if (num_fails < RW_LIST_MAX_FAILS) {
+                failed_rw_waiting_period(num_fails);
+                continue;
+            }
+
+            // Missed too many times, move on
+            break;
+        }
+
+        // Edge case: if the flink blink are the same entry, so a singular lock
+        BOOLEAN same_lock = FALSE;
+        if (blink_lock == flink_lock) {
+            same_lock = TRUE;
+        }
+
+        // Try to grab the blink's node, if its different
+        if (same_lock == FALSE) {
+            if (TryEnterCriticalSection(blink_lock) == FALSE) {
+                // If you failed to obatin the blink's lock, release the flink's lock, hoping that another thread will finish
+                LeaveCriticalSection(flink_lock);
+                num_fails++;
+
+                if (num_fails < RW_LIST_MAX_FAILS) {
+                    failed_rw_waiting_period(num_fails);
+                    continue;
+                }
+                break;
+            }
+        }
+
+        // Successfully obtained both the entry that we want to remove, and the locks of its flink and blink
+        // Change the flink blink of the page's flink blink
+        blink->Flink = flink;
+        flink->Blink = blink;
+        // Mark the current page off a list so get rid of its Flink Blink entries
+        entry->Flink = NULL;
+        entry->Blink = NULL;
+        InterlockedDecrement64(&list->size);
+
+        // Release the flink blink locks
+        if (same_lock == FALSE) {
+            LeaveCriticalSection(blink_lock);
+        }
+        LeaveCriticalSection(flink_lock);
+        ReleaseSRWLockShared(&list->rw_lock);
+        return;
+    }
+
+    // If we failed to try the fast way through the shared path, make it exclusive
+    ReleaseSRWLockShared(&list->rw_lock);
+    AcquireSRWLockExclusive(&list->rw_lock);
+
+    // Check again if it is still linked in case another thread also soft faulted on this same page
+    if (pfn->list.Flink != NULL) {
+        RemoveEntryList(&pfn->list);
+        pfn->list.Flink = NULL;
+        pfn->list.Blink = NULL;
+        InterlockedDecrement64(&list->size);
+    }
+
+    ReleaseSRWLockExclusive(&list->rw_lock);
+}
+
+// Helper that removes multiple pages off of a list fpr batching
+// Need to detach that batch from the list: to do so we need to fix the head's flink and the page we stopped ats blink
+// Try to get as many pages as possible, not guarntee batch_size
+ULONG_PTR
+get_batch_from_RW_list(PRW_LIST_HEAD list, pfn_metadata ** pfn_batch, ULONG_PTR max_batch_size) {
+    // Make sure there is a reasonable batch size
+    if (max_batch_size == 0) {
+        return 0;
+    }
+
+    // Try the optimized route
+    AcquireSRWLockShared(&list->rw_lock);
+
+    // Keep track of failed lock acquires
+    ULONG num_fails = 0;
+
+    while (TRUE) {
+        // Get the head_lock in order to get the front of the list
+        if (TryEnterCriticalSection(&list->head_lock) == FALSE) {
+            num_fails++;
+
+            // Wait after a failed accquirement to let other threads hopefully finish
+            if (num_fails < RW_LIST_MAX_FAILS) {
+                failed_rw_waiting_period(num_fails);
+                continue;
+            }
+
+            // Too many failures, try the hard way
+            break;
+        }
+
+        // Currently hold the head lock
+        ULONG_PTR curr_batch_size = 0;
+        PLIST_ENTRY curr_page = list->entry.Flink;
+
+        // We continue unless three things;
+        // 1. Collected batch size
+        // 2. List eneded, looped to the list_head again
+        // 3. Hit a page we can't get the lock of
+
+        // If we havent met the batch size or if we aren't at the end of the page
+        while (curr_batch_size < max_batch_size && curr_page != &list->entry) {
+            CRITICAL_SECTION * curr_lock = get_node_lock(list, curr_page);
+
+            // If we can't lock the next page even though we haven't hit the batch size, just give up
+            if (TryEnterCriticalSection(curr_lock) == FALSE) {
+                break;
+            }
+
+            // If we managed to obtain the lock, add it to our batch and move on to the next page
+            // Continue holding the page lock until the end
+            pfn_batch[curr_batch_size] = (pfn_metadata *) curr_page;
+            curr_batch_size++;
+            curr_page = curr_page->Flink;
+        }
+
+        // If the list is empty or failed to get the first page
+        if (curr_batch_size == 0) {
+            // Release the boundary lock
+            LeaveCriticalSection(&list->head_lock);
+            ReleaseSRWLockShared(&list->rw_lock);
+            return 0;
+        }
+
+        // Currently, curr_page is the first page we didnt get for three reasons
+        // 1. curr_page is the head_lock so we looped through
+        // 2. can't get curr_page's lock so move back by one, so boundary is a page we already hold (n-1)
+        // 3. we can get curr_page lock
+        // Check if it is case 1, which is we looped through the entire list
+        BOOLEAN end_of_list = FALSE;
+        if (curr_page == &list->entry) {
+            end_of_list = TRUE;
+        }
+        // Tracks if we grabbed an extra lock
+        BOOLEAN successful_boundary_lock = FALSE;
+
+        // We want to get the lock
+        // If curr_page is the head, we already have the lock
+        // If curr_page is a page, we need to get the lock
+        if (end_of_list == FALSE) {
+            // Curr is a real page, so try to lock it
+            if (TryEnterCriticalSection(get_node_lock(list, curr_page)) == TRUE) {
+                successful_boundary_lock = TRUE;
+            } else {
+                // Failed to lock the page. Make the boundary, the last page we got so we already have the lock
+                // Essentially shrink batch size by one
+                curr_batch_size--;
+                // Becomes new boundary
+                curr_page = &pfn_batch[curr_batch_size]->list;
+
+                // If we only obtained one page and couldn't get the second page's lock, and now the boundary is the
+                // first page, there is no page on our batch list
+                if (curr_batch_size == 0) {
+                    LeaveCriticalSection(&pfn_batch[0]->lock);
+                    LeaveCriticalSection(&list->head_lock);
+                    ReleaseSRWLockShared(&list->rw_lock);
+                    return 0;
+                }
+
+                successful_boundary_lock = TRUE;
+            }
+        }
+
+        // Update the head to go straight to the boundary, which is now curr_page
+        list->entry.Flink = curr_page;
+        curr_page->Blink = &list->entry;
+
+        // Update the pages that are going to get batched off and make sure that the flink blink is cleared
+        for (ULONG_PTR i = 0; i < curr_batch_size; i++) {
+            pfn_batch[i]->list.Flink = NULL;
+            pfn_batch[i]->list.Blink = NULL;
+        }
+        // Update the list size counter
+        InterlockedAdd64(&list->size, -(LONG64) curr_batch_size);
+
+        // Release the boundary lock
+        if (successful_boundary_lock == TRUE) {
+            LeaveCriticalSection(get_node_lock(list, curr_page));
+        }
+
+        LeaveCriticalSection(&list->head_lock);
+        ReleaseSRWLockShared(&list->rw_lock);
+
+        return curr_batch_size;
+    }
+
+    // Slow path, making the RW shared list to exclusive
+    ReleaseSRWLockShared(&list->rw_lock);
+    AcquireSRWLockExclusive(&list->rw_lock);
+
+    ULONG_PTR curr_batch_size = 0;
+    PLIST_ENTRY curr_page = list->entry.Flink;
+
+    while (curr_batch_size < max_batch_size && curr_page != &list->entry) {
+        pfn_metadata * page = (pfn_metadata *) curr_page;
+
+        // Only try to get the lock despite it being exclusive, since a soft faulter can grab a pfn per lock before us,
+        // The soft faulter tries to get pfn-per-lock then list lock, so if we tried list lock to pfn-per-lock, deadlock
+        if (TryEnterCriticalSection(get_node_lock(list, curr_page)) == FALSE) {
+            break;
+        }
+
+        pfn_batch[curr_batch_size] = page;
+        curr_batch_size++;
+        curr_page = curr_page->Flink;
+    }
+
+    // Tracks if we grabbed an extra lock
+    BOOLEAN successful_boundary_lock = FALSE;
+
+    if (curr_batch_size > 0) {
+        // Update the list data after removing the batch
+        list->entry.Flink = curr_page;
+        curr_page->Blink = &list->entry;
+
+        // Clean up the pfn batches flink blink data to ensure that we don't walk to wrong pages
+        for (ULONG_PTR i = 0; i < curr_batch_size; i++) {
+            pfn_batch[i]->list.Flink = NULL;
+            pfn_batch[i]->list.Blink = NULL;
+        }
+        InterlockedAdd64(&list->size, -(ULONG_PTR) curr_batch_size);
+    }
+
+    if (successful_boundary_lock == TRUE) {
+        LeaveCriticalSection(get_node_lock(list, curr_page));
+    }
+    ReleaseSRWLockExclusive(&list->rw_lock);
+    return curr_batch_size;
+}
+
+
 // Initializes the space for the page table and sets everything to valid bit, 0 and PFN, 0
 PVOID
 zero_malloc (SIZE_T num_bytes) {
@@ -560,6 +975,9 @@ set_pte_valid(PTE_SECTION * section, pfn_metadata * meta, PPTE pte, ULONG_PTR pf
     // No need for a compare especially because the old value could either be zero (hard fault) or transition (soft fault/disc)
     InterlockedExchange64((volatile LONG64 *) &pte->entire, (LONG64) new.entire);
 
+    // Check that makes sure that any page inserted in two places at once (like age list and else where)
+    // Helps check if our pfn data became stale, resulting in it going to the wrong path
+    ASSERT(meta->list.Flink == NULL);
     // Add pte into the smallest, hottest age list (i.e. 0) in its corresponding section
     InsertTailList(&section->age_lists[0], &meta->list);
     // Update the PTE section's age count
@@ -659,6 +1077,7 @@ setup_pfn_table(PULONG_PTR physical_page_numbers, ULONG_PTR physical_page_count)
         pfn_metadata * pfn = &pfn_table[frame_number];
 
         memset(pfn, 0, sizeof(pfn_metadata));
+        InitializeCriticalSectionAndSpinCount(&pfn->lock, 0x00000400);
         // Set up pfn per lock, single threaded no need for locks
         int index = (int)(frame_number % NUM_THREADS);
         InsertTailList(&free_lists[index].entry, &pfn->list);
@@ -1001,6 +1420,8 @@ pfn_metadata*
         pfn_metadata * meta = (pfn_metadata *) entry;
         meta->isOccupied = 1;
 
+        meta->list.Flink = NULL;
+        meta->list.Blink = NULL;
         LeaveCriticalSection(&curr_free_list->lock);
         return meta;
     }
@@ -1009,53 +1430,18 @@ pfn_metadata*
 // Repurposes multiple pages: one reserved for the faulting thread and the rest added to the free list
 pfn_metadata *
 repurpose_standby(VOID) {
-    EnterCriticalSection(&pfn_standby_list.lock);
+    pfn_metadata * pfn_batch[STANDBY_REFILL_BATCH];
 
-    // Verify that standby pages truly have pages available, under a lock
-    if (IsListEmpty(&pfn_standby_list.entry)) {
-        LeaveCriticalSection(&pfn_standby_list.lock);
+    // Try to grab a full batch
+    ULONG_PTR count = get_batch_from_RW_list(&pfn_standby_list, pfn_batch, STANDBY_REFILL_BATCH);
+
+    if (count == 0) {
         return NULL;
     }
 
-    // Go through the nodes of the standby list
-    PLIST_ENTRY head = &pfn_standby_list.entry;
-    PLIST_ENTRY first_page = head->Flink; // First entry in standby list
-    PLIST_ENTRY last_page = first_page; // Will hodl the value of the last page in our repurposed batch
-    ULONG_PTR count = 1;
-
-    // As long as there are entries on the standby list, and less than batch size
-    // Find where the batch ends, and store the pointer to that page
-    while (count < STANDBY_REFILL_BATCH && last_page->Flink != head) {
-        last_page = last_page->Flink;
-        count++;
-    }
-
-    // First page not in the repurpose batch
-    PLIST_ENTRY new_standby_head = last_page->Flink;
-
-    // Update the standby_list head to remove our batch
-    head->Flink = new_standby_head;
-    new_standby_head->Blink = head;
-
-    // Update the counter
-    pfn_standby_list.size -= count;
-
-    // Update our local batch list to ensure we can iterate through without accessing pointers to pages on standby
-    first_page->Blink = last_page;
-    last_page->Flink = first_page;
-
-    // The batch we just took off is private; hterefore, no need for a lock as it is not on any list
-    PLIST_ENTRY current = first_page;
-
-    // TODO: lowk if we are just going to iterate through the linked list, just remove off of standby one by one
-    // TODO: no point anymore to do batch off since we still have to hold the lock
-
-
-    // TODO: if you are batching off the standby, you have to ignore a locked lists' flink blink
+    // Flip each page's PTE from transition to disc format
     for (ULONG_PTR i = 0; i < count; i += 1) {
-        PLIST_ENTRY next_page = current->Flink;
-
-        pfn_metadata * meta = (pfn_metadata *) current;
+        pfn_metadata * meta = pfn_batch[i];
         PPTE old_pte = meta->pte;
 
         // Change the PTE from transition to disk format
@@ -1084,43 +1470,33 @@ repurpose_standby(VOID) {
         }
 
         meta->isOccupied = 1;
-        current = next_page;
     }
 
-    LeaveCriticalSection(&pfn_standby_list.lock);
-
-    // Take the first of the newly repurposed pages
-    pfn_metadata * return_pfn = (pfn_metadata *) first_page;
+    // Keep the first page for the caller to use and unlock it given they came locked
+    pfn_metadata * return_pfn = pfn_batch[0];
+    LeaveCriticalSection(&return_pfn->lock);
 
     // Add the remaining newly repurposed pages onto the free list
+    // They came locked so need to unlock it
     if (count > 1) {
-        // Get the first and last page of our newly repurposed pages to add onto free list
-        PLIST_ENTRY batch_first = first_page->Flink;
-        PLIST_ENTRY batch_last = last_page;
-
         // Update the free list hands so pages are distributed evenly across the many free lists
         int index = (int) (InterlockedIncrement(&free_list_hand) % NUM_THREADS);
         LIST_HEAD * curr_free_list = &free_lists[index];
 
         EnterCriticalSection(&curr_free_list->lock);
 
-        // Get the current head and tail
-        PLIST_ENTRY free_head = &curr_free_list->entry;
-        PLIST_ENTRY free_tail = free_head->Blink;
+        for (ULONG_PTR i = 1; i < count; i += 1) {
+            InsertTailList(&curr_free_list->entry, &pfn_batch[i]->list);
+            curr_free_list->size++;
+            LeaveCriticalSection(&pfn_batch[i]->lock);
+        }
 
-        // Insert the newly repurposed pages into the free list
-        free_tail->Flink = batch_first;
-        batch_first->Blink = free_tail;
-        batch_last->Flink = free_head;
-        free_head->Blink = batch_last;
-
-        // Update the counter size
-        curr_free_list->size += (count - 1);
         InterlockedAdd64(&total_free_pages, (LONG64) (count - 1));
         LeaveCriticalSection(&curr_free_list->lock);
     }
 
     return return_pfn;
+
 }
 
 // Page Helper
@@ -1402,18 +1778,15 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
         return FALSE;
     }
 
-    // Need the pfn_lock if editing the data
-    EnterCriticalSection (&pfn_modified_list.lock);
-    EnterCriticalSection (&pfn_standby_list.lock);
-
+    // Get the page's own lock as page then list order
+    EnterCriticalSection(&meta->lock);
 
     // Check the status of the PTE after releasing the lock as another thread could have altered its contents/status
     // Necessary because I set my access bit without a PTE section lock; therefore, I must check before I continue
     // If the PTE does not satisfy a soft fault, return to full_virtual memory to force another page fault and reroute
     // to correct function that can resolve the fault
     if (pte->transition.transition != 1 || pte->transition.frame_number != pfn) {
-        LeaveCriticalSection (&pfn_modified_list.lock);
-        LeaveCriticalSection (&pfn_standby_list.lock);
+        LeaveCriticalSection (&meta->lock);
         return FALSE;
     }
 
@@ -1423,34 +1796,31 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
     // Therefore, allowing the disc to release the slot
     if (meta->write_in_progress == 1) {
         // Can update the write_in_progress bit about the soft fault so the disc can later empty the stale slot
-        meta->write_in_progress = 0;
-    } else {
-        // Check if page is in standby used to trigger empty disc slot after releasing the lock
-        BOOL was_standby = (meta->isOccupied == 3);
+        meta->write_in_progress = 0;                                                                           
+    }
+    else if (meta->isOccupied == 3) {
+        // Currently, on the standby list, remove it
+        remove_entry_RW_list(&pfn_standby_list, meta);
+        reclaim_disc_slot = TRUE;
+    } else if (meta->isOccupied == 2) {
+        // Check if its modified
 
-        // Remove the page from the standby/modified list
-        RemoveEntryList (&meta->list);
-
-        // Update the counter
-        if (was_standby) {
-            pfn_standby_list.size--;
-            reclaim_disc_slot = TRUE;
-        } else {
-            // There was a soft fault from the modified list count
-            pfn_modified_list.size--;
-        }
+        // On the modified list
+        EnterCriticalSection(&pfn_modified_list.lock);
+        ASSERT(meta->list.Flink != NULL);
+        RemoveEntryList(&meta->list);
+        // Clean flink blink data
+        meta->list.Flink = NULL;
+        meta->list.Blink = NULL;
+        pfn_modified_list.size--;
+        LeaveCriticalSection(&pfn_modified_list.lock);
     }
 
-    // TODO: is this needed?
-    meta->isOccupied = 1;
-
-    // Release the lock
-    LeaveCriticalSection (&pfn_modified_list.lock);
-    LeaveCriticalSection (&pfn_standby_list.lock);
-
-    // Update the pfn metadata; Lock-free because the page is removed from global lists and isOccupied is already TRUE
     activate_page(pte, meta, pfn);
 
+    // Release the lock
+    LeaveCriticalSection (&meta->lock);
+    
     // Is it not already mapped; therefore, we only need to mark it as valid?
     if (MapUserPhysicalPages (aligned_va, 1, &pfn) == FALSE) {
         printf ("soft fault: full_virtual_memory_test : could not map VA %p to page %llX\n", aligned_va, pfn);
@@ -1708,17 +2078,34 @@ write_thread (LPVOID lpParam) {
             PLIST_ENTRY next = current->Flink;
 
             pfn_metadata * meta = (pfn_metadata *) current;
+
+            // Try to get the lock
+            if (TryEnterCriticalSection(&meta->lock) == FALSE) {
+                current = next;
+                continue;
+            }
+
+            // Make sure its still a modified page we hold
+            if (meta->isOccupied != 2 || meta->write_in_progress != 0) {
+                LeaveCriticalSection(&meta->lock);
+                current = next;
+                continue;
+            }
             // Mark as writing to disk
             meta->write_in_progress = 1;
 
             // Move the page off the modified list so any other list cannot access it
             RemoveEntryList(&meta->list);
+            // Clean flink blink data
+            meta->list.Flink = NULL;
+            meta->list.Blink = NULL;          
             pfn_modified_list.size--;
             meta->write_in_progress = 1;
 
             // Add to the array of pages to write to disk and increment counter
             pages_to_write[num_pages_written++] = meta;
 
+            LeaveCriticalSection(&meta->lock);
             // Move onto the next one
             current = next;
         }
@@ -1736,8 +2123,6 @@ write_thread (LPVOID lpParam) {
         DIAG_INC(write_call_count);
         DIAG_ADD64(write_total_pages, num_pages_written);
 
-        EnterCriticalSection(&pfn_modified_list.lock);
-        EnterCriticalSection(&pfn_standby_list.lock);
 
         // Determine the pfn_state of each page written to disk based on the write_in_progress bit
         // Specifically watching out for a soft fault that happened during the write to disk
@@ -1752,8 +2137,11 @@ write_thread (LPVOID lpParam) {
                 continue;
             }
 
+            EnterCriticalSection(&meta->lock);
+
             // Check if the write in progress is invalid, meaning there was a soft fault mid-write
             if (meta->write_in_progress == 0) {
+                LeaveCriticalSection(&meta->lock);
                 // Disc slot no longer needed and stale
                 empty_disc_slot(slot);
                 continue;
@@ -1767,11 +2155,9 @@ write_thread (LPVOID lpParam) {
             meta->isOccupied = 3;
 
             // Move the page into the disk linked list and update counter
-            InsertTailList (&pfn_standby_list.entry, &meta->list);
-            pfn_standby_list.size++;
+            insert_tail_RW_list (&pfn_standby_list, meta);
+            LeaveCriticalSection(&meta->lock);
         }
-        LeaveCriticalSection(&pfn_modified_list.lock);
-        LeaveCriticalSection(&pfn_standby_list.lock);
 
         // Tell the get_free_page function that there are now standby lists ready if needed
         SetEvent(pages_available);
@@ -1932,15 +2318,22 @@ trim_a_section(PTE_SECTION *section, int section_batch_size, int include_access_
         // Go through each list from the end to skipp any pages with a valid access bit
         // Therefore, the recently accessed pages will remain on the list until the ager moves it accorindlgy
         PLIST_ENTRY current = section->age_lists[age].Flink;
-
+        // Refresh the value of the head
+        PLIST_ENTRY head = &section->age_lists[age];
         // TODO: wth is hapepnign with my ageListCounts
         // Continue while there are pages on the age list or while number of pages trimmed is less than batch size
-        while (current != &section->age_lists[age] && sec_pages_trimmed < section_batch_size) {
+        while (current != head && sec_pages_trimmed < section_batch_size) {
             // Grab the next pointer
             PLIST_ENTRY next = current->Flink;
 
             // Get the pfn metadata of the current page we might trim to get PTE
             pfn_metadata * trim_page = (pfn_metadata *) current;
+
+            // Check that the entry we got is a valid pfn, and is not stale
+            if (trim_page < pfn_table || trim_page > &pfn_table[max_frame_number]) {
+                DebugBreak();
+                break;
+            }
             PPTE pte = trim_page->pte;
 
             // FInd the state of the PTE
@@ -1982,6 +2375,9 @@ trim_a_section(PTE_SECTION *section, int section_batch_size, int include_access_
             // Remove from its age list
 
             RemoveEntryList(&trim_page->list);
+            // Clean the flink blink data
+            trim_page->list.Flink = NULL;
+            trim_page->list.Blink = NULL;
             section->age_counts[age]--;
 
             trimmed_pages_vas[sec_pages_trimmed] = get_va_from_pte(pte);
@@ -2003,15 +2399,33 @@ trim_a_section(PTE_SECTION *section, int section_batch_size, int include_access_
         // Update the trimmed_pages to the modified status
         EnterCriticalSection(&pfn_modified_list.lock);
         for (int i = 0; i < sec_pages_trimmed; i++) {
-            // Check if the page is already on the modified list
-            // As it will cause the page to be on the modified list twice, messing up the writer
-            if (trimmed_pages[i]->isOccupied == 2) {
+            pfn_metadata * meta = trimmed_pages[i];
+
+            // Get the page lock
+            if (TryEnterCriticalSection(&meta->lock) == FALSE) {
                 continue;
             }
-            trimmed_pages[i]->isOccupied = 2;
+
+            PPTE pte = meta->pte;
+            ULONG_PTR pfn = find_frame_number_from_pfn(meta);
+
+            // Check if soft fault reactivated it
+            if (pte->transition.transition != 1 || pte->transition.frame_number != pfn) {
+                LeaveCriticalSection(&meta->lock);
+                continue;
+            }
+
+            // Double check the status in fear of a soft fault
+            if (meta->isOccupied != 1) {
+                LeaveCriticalSection(&meta->lock);
+                continue;
+            }
+
+            meta->isOccupied = 2;
             // Add onto modified list
-            InsertTailList(&pfn_modified_list.entry, &trimmed_pages[i]->list);
+            InsertTailList(&pfn_modified_list.entry, &meta->list);
             pfn_modified_list.size++;
+            LeaveCriticalSection(&meta->lock);
         }
         LeaveCriticalSection(&pfn_modified_list.lock);
     }
@@ -2085,7 +2499,7 @@ initialize_system() {
     ULONG_PTR virtual_address_size;
 
     initialize_list_head(&pfn_modified_list);
-    initialize_list_head(&pfn_standby_list);
+    initialize_RW_list(&pfn_standby_list);
     for (int i = 0; i < NUM_THREADS; i++) {
         initialize_list_head(&free_lists[i]);
     }
