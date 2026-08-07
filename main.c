@@ -151,6 +151,8 @@
 #define AGE_MAX_SECTIONS 20 // Max sections to age at a time
 #define STANDBY_REFILL_BATCH 32 // Number of extra standby pages to repurpose during a get_free_pages call to add onto free list
 
+#define PERSONAL_FREE_LIST_SIZE 32
+
 // Global to keep track of the dynamic batch size of the ager
 volatile LONG age_batch_sections = 10;
 
@@ -370,6 +372,10 @@ LIST_ENTRY disc_free_list;
 // NEW GLOBALS: REORGANIZE
 // Keeps track of the age hand
 ULONG_PTR age_hand = 0;
+
+// Each thread holds their own local free list
+__declspec(thread) pfn_metadata * my_free_list[PERSONAL_FREE_LIST_SIZE];
+__declspec(thread) int my_free_list_count = 0;
 
 // Emergency vs preemptive trim tracking
 volatile LONG emergency_trim_count = 0;   // worker ran dry, forced trim
@@ -1393,38 +1399,78 @@ request_pages(BOOL is_emergency) {
 }
 
 // Get Free Pages Helpers
-// Go through each free list to find a empty page
-pfn_metadata*
-    get_free_list_page (void) {
+
+// Refill a thread's local free list from a single public free list with a single lock
+// Returns number of pages successfully added
+int
+refill_personal_free_list(VOID) {
+    // Try to obtain the locks of the public free list, starting with the one corresponding with its thread_id
     for (int i = 0; i < NUM_THREADS; i++) {
         int index = (my_thread_id + i) % NUM_THREADS;
-        LIST_HEAD *curr_free_list = &free_lists[index];
+        LIST_HEAD * curr_public_free_list = &free_lists[index];
 
-        // Move on if we can't obtain the lock
-        if (TryEnterCriticalSection(&curr_free_list->lock) == FALSE) {
+        // Skip a public free list if you fail to obtain the lock on first try
+        if (TryEnterCriticalSection(&curr_public_free_list->lock) == FALSE) {
             continue;
         }
 
-        // Check if it is empty
-        if (IsListEmpty(&curr_free_list->entry)) {
-            LeaveCriticalSection(&curr_free_list->lock);
+        // Check if the public free list has available slots
+        if (IsListEmpty(&curr_public_free_list->entry)) {
+            LeaveCriticalSection(&curr_public_free_list->lock);
             continue;
         }
 
-        PLIST_ENTRY entry = RemoveHeadList(&curr_free_list->entry);
-        curr_free_list->size--;
+        int num_pages_pulled = 0;
 
-        // Decrement the total free pages estimate counter
-        InterlockedDecrement64(&total_free_pages);
+        // Go through this public free list with pages and move them to the thread's local free list
+        // Iterate while we haven't gotten enough pages and as there is enough supply in the public free list
+        while (num_pages_pulled < PERSONAL_FREE_LIST_SIZE && IsListEmpty(&curr_public_free_list->entry) == FALSE) {
+            PLIST_ENTRY entry = RemoveHeadList(&curr_public_free_list->entry);
+            curr_public_free_list->size--;
 
-        pfn_metadata * meta = (pfn_metadata *) entry;
-        meta->isOccupied = 1;
+            // Make sure to unlink the page from the public free list
+            pfn_metadata * meta = (pfn_metadata *) entry;
+            meta->list.Flink = NULL;
+            meta->list.Blink = NULL;
 
-        meta->list.Flink = NULL;
-        meta->list.Blink = NULL;
-        LeaveCriticalSection(&curr_free_list->lock);
-        return meta;
+            // Put onto the local free list
+            my_free_list[num_pages_pulled] = meta;
+            num_pages_pulled += 1;
+        }
+
+        LeaveCriticalSection(&curr_public_free_list->lock);
+
+        // TODO: later on find a better counter than my current logic
+        // Update the total public free pages counter, treating these ones as consumed
+        InterlockedAdd64(&total_free_pages, -(LONG64) num_pages_pulled);
+
+        my_free_list_count = num_pages_pulled;
+        return num_pages_pulled;
     }
+
+    // Failed to retrieve any page
+    return 0;
+}
+
+// Try to get free pages from the thread's local free list
+pfn_metadata*
+    get_free_list_page (void) {
+    // Given that the thread's free list are local to the thread, no need for a lock
+    if (my_free_list_count > 0) {
+        // Update the size counter that also doubles as a index to track which slots we've taken
+        my_free_list_count -= 1;
+
+        return my_free_list[my_free_list_count];
+    }
+
+    // If the local thread's free list is empty, refill in one batch
+    if (refill_personal_free_list() > 0) {
+        // Update the size counter that also doubles as a index to track which slots we've taken
+        my_free_list_count -= 1;
+
+        return my_free_list[my_free_list_count];
+    }
+
     return NULL;
 }
 // Repurposes multiple pages: one reserved for the faulting thread and the rest added to the free list
