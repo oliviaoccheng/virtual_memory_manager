@@ -1808,6 +1808,15 @@ consumption_rate() {
 // Calling function needs to hold the pte_lock
 BOOL
 handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta, ULONG_PTR * official_pfn) {
+    // Although caller holds the pte section lock, the repurpose standby can change it without a lock by using interlocked operations
+    // Therefore, before changing, must check the currrent state as it may have changed
+    PTE check;
+    check.entire = pte->entire;
+
+    // If it is no longer in transition PTE. punt it so it can recheck its state and reroute to correct path
+    if (check.transition.transition != 1) {
+        return FALSE;
+    }
     // Caller holds section lock
     PTE_SECTION *section = get_section(pte);
 
@@ -1890,6 +1899,39 @@ handle_soft_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
     return TRUE;
 }
 
+__declspec(noinline)
+BOOL
+map_temp_va (PULONG_PTR temp_va, ULONG_PTR pfn) {
+    // Map the frame to this temp va
+    if (MapUserPhysicalPages(temp_va, 1, &pfn) == FALSE) {
+        printf("hard fault: could not map scratch VA for page %llX\n", pfn);
+        DebugBreak();
+        return FALSE;
+    }
+    return TRUE;
+}
+
+VOID
+batch_unmap_tempva () {
+    // Get the starting va of the thread's temp va space
+    PULONG_PTR temp_va_start = get_temp_va(0);
+    if (MapUserPhysicalPages(temp_va_start, my_temp_va_count, NULL) == FALSE) {
+        printf("Temp Va: batch unmap failed");
+        DebugBreak();
+    }
+    my_temp_va_count = 0;
+}
+
+__declspec(noinline)
+BOOL
+map_official_page(PULONG_PTR aligned_va, ULONG_PTR pfn) {
+    if (MapUserPhysicalPages (aligned_va, 1, &pfn) == FALSE) {
+        printf ("hard fault: full_virtual_memory_test : could not map VA %p to page %llX\n", aligned_va, pfn);
+        DebugBreak();
+        return FALSE;
+    }
+    return TRUE;
+}
 // Calling function needs to hold the pte_lock
 BOOL
 handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta, ULONG_PTR * official_pfn) {
@@ -1925,31 +1967,27 @@ handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
     // Get the frame number of the free page using pointer arithmetic
     ULONG_PTR pfn = find_frame_number_from_pfn((meta));
 
-    // TODO: speculative reads. Idea that I am going linearly, to map several more pages then necessary
-    // TODO: track my success on speculative reads which would then dictate further premptiveness extra mapping
-    // Check if the thread's temp VA space is full. If so, unmap before getiing a free slot
-    if (my_temp_va_count == TEMP_VA_SIZE) {
-        // Get the starting va of the thread's temp va space
-        PULONG_PTR temp_va_start = get_temp_va(0);
-        if (MapUserPhysicalPages(temp_va_start, my_temp_va_count, NULL) == FALSE) {
-            printf("Temp Va: batch unmap failed");
-            DebugBreak();
-        }
-        my_temp_va_count = 0;
-    }
-
-    // Map the data on the page's data onto the temp page before freeing the page
-    PULONG_PTR temp_va = get_temp_va(my_temp_va_count);
-
-    // Map the frame to this temp va
-    if (MapUserPhysicalPages(temp_va, 1, &pfn) == FALSE) {
-        printf("hard fault: could not map scratch VA for page %llX\n", pfn);
-        DebugBreak();
-        return FALSE;
-    }
-
     // If the pte was in disc state
     if (pte->disc.disc == 1) {
+        // TODO: speculative reads. Idea that I am going linearly, to map several more pages then necessary
+        // TODO: track my success on speculative reads which would then dictate further premptiveness extra mapping
+        // Check if the thread's temp VA space is full. If so, unmap before getiing a free slot
+        if (my_temp_va_count == TEMP_VA_SIZE) {
+            batch_unmap_tempva();
+        }
+        // TODO: use declspec toc reate local VA
+        // TODO: trigger a thread to unmap
+
+        // Map the data on the page's data onto the temp page before freeing the page
+        PULONG_PTR temp_va = get_temp_va(my_temp_va_count);
+
+        if (map_temp_va(temp_va, pfn) == FALSE) {
+            DebugBreak();
+            return FALSE;
+        }
+        // Update the thread's individual temp va counters and store the temp va for unmapping later
+        my_temp_va_count++;
+
         // Give the pte is in disc state, it stores the disc index
         ULONG_PTR slot_on_disc = pte->disc.disc_index;
 
@@ -1964,21 +2002,25 @@ handle_hard_fault(PPTE pte, PULONG_PTR aligned_va, pfn_metadata ** official_meta
         memcpy(temp_va, (char*)official_disc + slot_on_disc * PAGE_SIZE, PAGE_SIZE);
         // Mark the data in the disc slot to be invalid
         empty_disc_slot(slot_on_disc);
+
+        activate_page(pte, meta, pfn);
+
+        // Map the VA to the physical page
+        if (map_official_page(aligned_va, pfn) == FALSE) {
+            DebugBreak();
+            return FALSE;
+        }
     } else {
+        activate_page(pte, meta, pfn);
+
+        // Map the VA to the physical page
+        if (map_official_page(aligned_va, pfn) == FALSE) {
+            DebugBreak();
+            return FALSE;
+        }
+
         // Zeros the page if new
-        memset(temp_va, 0, PAGE_SIZE);
-    }
-
-    // Update the thread's individual temp va counters and store the temp va for unmapping later
-    my_temp_va_count++;
-
-    activate_page(pte, meta, pfn);
-
-    // Map the VA to the physical page
-    if (MapUserPhysicalPages (aligned_va, 1, &pfn) == FALSE) {
-        printf ("hard fault: full_virtual_memory_test : could not map VA %p to page %llX\n", aligned_va, pfn);
-        DebugBreak();
-        return FALSE;
+        memset(aligned_va, 0, PAGE_SIZE);
     }
 
     // TODO: do disc bit maps for interlocked that can help get rid of the disk lock
