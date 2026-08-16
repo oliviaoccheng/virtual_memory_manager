@@ -122,7 +122,8 @@
 
 // Triming and Writing Batch Size and Threseholds
 // The bar we have to meet to trigger trimming measured by free+standby count
-#define TRIM_LOW_BAR 500
+#define TRIM_LOW_BAR NUMBER_OF_PHYSICAL_PAGES / 10
+#define TRIM_HIGH_WATERMARK (TRIM_LOW_BAR * 5)
 #define EMERGENCY_LOW_BAR 120
 #define TRIM_BATCH_SIZE 800 // How many pages to trim per batch
 // TODO: later make this number dynamic based on pressure instead of constat
@@ -142,8 +143,8 @@
 // Constants for the linear and random accesses
 #define MIN_RUN_PAGES 16 // Shortest linear walk
 #define MAX_RUN_PAGES 512 // Longest linear walk
-#define REVISIT_CHANCE 4 // 1/REVISIT_CHANCE probability to revisit a spot
-#define HOT_SPOTS 8
+#define REVISIT_CHANCE 2 // 1/REVISIT_CHANCE probability to revisit a spot
+#define HOT_SPOTS 64
 
 // NEW CONSTANTS: REORGANIZE
 // How many sections we age per call
@@ -166,7 +167,7 @@ volatile LONG age_batch_sections = 10;
 #endif
 
 // Debug Assert
-#define DEBUG 0
+#define DEBUG 1
 
 #if DEBUG
 #define ASSERT(x) {if(!(x)) DebugBreak();}
@@ -1165,29 +1166,37 @@ init_locality_state(LOCALITY_STATE *loc, THREAD_RNG_STATE *rng, ULONG_PTR total_
 // (via locality_advance), so this only re-derives the VA each call.
 PULONG_PTR
 locality_next_va(LOCALITY_STATE *loc, THREAD_RNG_STATE *rng, ULONG_PTR total_pages) {
+    // REVISIT: re-touch an exact recent page and return immediately.
+    if (loc->hot_count > 0 && (GetNextRandom(rng) % REVISIT_CHANCE) == 0) {
+        ULONG_PTR a = GetNextRandom(rng) % loc->hot_count;
+        ULONG_PTR b = GetNextRandom(rng) % loc->hot_count;
+        ULONG_PTR back = (a < b) ? a : b;
+        int idx = loc->hot_next - 1 - (int)back;
+        while (idx < 0) idx += HOT_SPOTS;
+        ULONG_PTR page = loc->hot[idx];
+        if (page >= total_pages) page = total_pages - 1;   // safety clamp
+        return start + (page * CHUNKS_PER_PAGE);
+    }
 
-    if (loc->run_left == 0) {                       // start a fresh run
-        ULONG_PTR r = GetNextRandom(rng);
+    // LINEAR RUN. Start a fresh one whenever the current run is exhausted
+    // OR cur_page has reached the end. Use a SIGNED-safe check, not ==0,
+    // so a wrapped/oversized run_left can't skip re-initialization.
+    if (loc->run_left == 0 || loc->cur_page >= total_pages) {
+        loc->base_page = GetNextRandom(rng) % total_pages;
 
-        if (loc->hot_count > 0 && (r % REVISIT_CHANCE) == 0) {
-            // Hot jump: back to a recent base (should still be young).
-            loc->base_page = loc->hot[GetNextRandom(rng) % loc->hot_count];
-        } else {
-            // Cold jump: somewhere new, and record it as a hot spot.
-            loc->base_page = GetNextRandom(rng) % total_pages;
-            loc->hot[loc->hot_next] = loc->base_page;
-            loc->hot_next = (loc->hot_next + 1) % HOT_SPOTS;
-            if (loc->hot_count < HOT_SPOTS) loc->hot_count++;
+        ULONG_PTR span = MIN_RUN_PAGES +
+                         (GetNextRandom(rng) % (MAX_RUN_PAGES - MIN_RUN_PAGES));
+
+        // Clamp the run so base_page + span never exceeds total_pages.
+        if (loc->base_page + span > total_pages) {
+            span = total_pages - loc->base_page;
+        }
+        if (span == 0) {                    // base_page was the last page
+            loc->base_page = 0;
+            span = MIN_RUN_PAGES;
         }
 
-        loc->run_left = MIN_RUN_PAGES +
-                        (GetNextRandom(rng) % (MAX_RUN_PAGES - MIN_RUN_PAGES));
-
-        if (loc->base_page + loc->run_left > total_pages) {   // clamp to VA space
-            loc->run_left = total_pages - loc->base_page;
-            if (loc->run_left == 0) { loc->base_page = 0; loc->run_left = MIN_RUN_PAGES; }
-        }
-
+        loc->run_left = span;
         loc->cur_page = loc->base_page;
     }
 
@@ -1197,8 +1206,16 @@ locality_next_va(LOCALITY_STATE *loc, THREAD_RNG_STATE *rng, ULONG_PTR total_pag
 // Call once after a successful (non-faulting) access to step through the run.
 VOID
 locality_advance(LOCALITY_STATE *loc) {
+    // Record the exact page just stamped so revisits can find it.
+    loc->hot[loc->hot_next] = loc->cur_page;
+    loc->hot_next = (loc->hot_next + 1) % HOT_SPOTS;
+    if (loc->hot_count < HOT_SPOTS) loc->hot_count++;
+
+    // Step the run, but NEVER let run_left underflow.
+    if (loc->run_left > 0) {
+        loc->run_left--;
+    }
     loc->cur_page++;
-    loc->run_left--;
 }
 
 // DISC HELPER
@@ -1719,7 +1736,7 @@ compute_trim_size(BOOL is_emergency) {
     }
 
     // Number of pages I lack right now
-    LONG deficit = (LONG) (TRIM_LOW_BAR - supply);
+    LONG deficit = (LONG) (TRIM_HIGH_WATERMARK - supply);
     LONG trim_size;
 
     // Take the number that is bigger: deficit v. demand gap
