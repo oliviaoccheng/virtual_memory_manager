@@ -217,9 +217,27 @@ Set `DEBUG` to 0 for timing runs.
 
 ## Where This Goes Next
 
-- **Lock-free disc allocator:** replace the disc free list and its lock with a bitmap claimed using `_interlockedbittestandset64`.
-- **Zero thread:** zero pages in the background so first-touch faults don't pay for a `memset`.
-- **Speculative reads:** a disc fault in the middle of a linear run means the next pages are coming, so read several pages at once.
-- **Clean pages:** skip rewriting pages that haven't changed since their last trip to disc.
-- **Split `main.c`** into modules.
+### Lock-Free Disc Allocator
 
+The disc is the last part of the manager that still uses one global lock. Free disc slots live on a linked list behind `disc_lock`, so the writer allocating a batch of 500 slots and a worker freeing a slot after a disc read have to take turns. A bitmap with one bit per slot would remove that lock. To allocate, a thread reads a 64-bit word, uses `_BitScanForward64` on its complement to find a free bit, and claims it with `_interlockedbittestandset64`. If another thread claims the same bit first, the claim fails and it reads the word again. To free a slot, `_interlockedbittestandreset64` clears the bit and returns its old value, which also catches double frees, the case `empty_disc_slot` currently checks for under the lock. Giving each thread a hint for which word to start from would spread threads across the bitmap, so they don't all compete for slot zero.
+
+### A Zero Thread
+
+Windows never gives a program a page that still holds another program's data, so a first-touch fault has to hand back a zeroed page. Right now the worker does that itself: it maps the page at its real address and runs `memset` across all 4 KB while holding the section lock. A background zero thread could keep a list of pre-zeroed pages topped up between a low and a high watermark. It would map a batch of free pages into a scratch window, zero them all, and unmap them in one call. A first-touch fault would then cost just one map. When the free lists run dry, the zero thread could pull from the cold end of standby, which is the tail, since the head is what workers want to rescue.
+
+### Speculative Reads
+
+The workload walks pages in runs of up to 512 pages in a row, so a disc fault in the middle of a run is a strong hint that the next few pages are about to fault too. Since I'm already paying for a scratch mapping and a `memcpy` from disc, I could read the next several pages in the same trip, if their PTEs are also in disc format. The tricky part is measuring the payoff: count how many speculatively read pages actually get touched before they're trimmed, and use that hit rate to decide how far ahead to read. Reading ahead on a random jump just wastes free pages, so the read-ahead distance should shrink when the hit rate drops.
+
+### Clean Pages
+
+Every page the trimmer evicts is treated as dirty and goes to the modified list, even if its contents haven't changed since it was last written to disc. That's the biggest source of wasted work in the pipeline. A page that comes back through a soft fault from standby, and is only read afterward, still has a valid copy on disc. Adding a dirty bit would let the trimmer send clean pages straight to standby, skipping the modified list and the writer. The writer's batches would then contain only pages that actually changed, so the whole trim-to-standby pipeline would move faster for the same disc bandwidth. This would also require keeping a page's disc slot reserved while it's active, instead of freeing it on every soft fault from standby the way `handle_soft_fault` does now.
+
+### Multilevel Page Tables
+
+The page table is one flat array with an entry for every virtual page. That's why the virtual address space is limited to what physical memory plus the disc can actually back. Turning page tables into ordinary pages, each holding 512 PTEs and pointed to by a PTE one level up, would let me reserve far more address space than I can back, and only build the parts of the tree that are actually touched. Each page-table page would also become a natural PTE section, with its lock in the parent PTE that points to it. That would replace my 64 fixed sections with ones that follow the shape of the address space.
+
+### Smaller Items
+
+- **Fairer trimming.** Both trimmer passes always start at section 0, so low sections get trimmed far more than high ones. A clock hand like the ager's would spread evictions evenly.
+- **Adaptive batch sizes.** `TRIM_BATCH_SIZE`, `WRITE_BATCH_SIZE` and `TRIM_LOW_BAR`
