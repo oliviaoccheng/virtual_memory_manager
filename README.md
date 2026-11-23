@@ -223,6 +223,3 @@ Set `DEBUG` to 0 for timing runs.
 - **Clean pages:** skip rewriting pages that haven't changed since their last trip to disc.
 - **Split `main.c`** into modules.
 
-## Acknowledgments
-
-Thanks to my mentor at Microsoft for guiding me through this all summer, and to Lily Kassaei, Noah Persily, and Landon Moceri, whose memory managers I learned from. The per-thread XOR-shift random number generator is adapted from Noah's.
