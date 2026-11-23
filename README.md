@@ -1,6 +1,6 @@
 # A Multithreaded User-Mode Virtual Memory Manager
 
-By Olivia Cheng, Summer 2026. Reach out with questions at **[your email]**.
+By Olivia Cheng, Summer 2026. Reach out with questions at oliviaoc.cheng@gmail.com.
 
 ## The Goal
 
